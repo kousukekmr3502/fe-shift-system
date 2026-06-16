@@ -583,7 +583,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             th, td {{ border: 1px solid #ddd; padding: 10px; text-align: center; }} th {{ background: #f1f6e0; }}
             .month-form {{ display: grid; grid-template-columns: 1fr 1fr 100px; gap: 8px; align-items: end; }}
             .day-card {{ background: white; border-radius: 18px; margin-bottom: 20px; box-shadow: 0 3px 12px rgba(0,0,0,0.12); overflow: hidden; border: 2px solid var(--fe-line); }}
-            .day-card.today {{ border: 3px solid var(--fe-green-dark); }}
+            .day-card.today {{ border: 4px solid var(--fe-green-dark) !important; box-shadow: 0 0 0 3px rgba(166,206,57,0.28), 0 3px 12px rgba(0,0,0,0.12); }}
             .day-head {{ display: grid; grid-template-columns: 90px 1fr; border-bottom: 1px solid #ddd; }}
             .day-label {{ background: #f5f5f5; text-align: center; padding: 12px 6px; font-size: 22px; font-weight: 900; border-right: 1px solid #ddd; }}
             .day-label .dow {{ font-size: 26px; }} .day-label .date-num {{ font-size: 28px; margin-top: 8px; }}
@@ -790,6 +790,22 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 border: 1px solid #000;
             }}
 
+        
+            .publish-table th,
+            .publish-table td {{
+                vertical-align: middle !important;
+                text-align: center;
+            }}
+            .publish-table .publish-state {{
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                min-width: 64px;
+                height: 32px;
+                line-height: 1 !important;
+                margin: 0 auto !important;
+            }}
+
         </style>
     </head>
     <body>
@@ -870,9 +886,21 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                         return;
                     }}
                 }}
+                // Renderのサーバー日付ではなく、見ている端末の今日の日付で判定する
+                const now = new Date();
+                const localToday = now.getFullYear() + '-' +
+                    String(now.getMonth() + 1).padStart(2, '0') + '-' +
+                    String(now.getDate()).padStart(2, '0');
+
+                document.querySelectorAll('.day-card.today').forEach(function(el) {{
+                    el.classList.remove('today');
+                }});
+                const localTodayCard = document.querySelector('[data-date="' + localToday + '"]');
+                if (localTodayCard) localTodayCard.classList.add('today');
+
                 if (!AUTO_SCROLL_TO_TODAY) return;
-                const today = document.querySelector('[data-today="1"]');
-                if (today) today.scrollIntoView({{behavior: 'smooth', block: 'start'}});
+                const target = localTodayCard || document.querySelector('[data-today="1"]');
+                if (target) target.scrollIntoView({{behavior: 'smooth', block: 'start'}});
             }});
 
             window.addEventListener('click', function(e) {{
@@ -901,7 +929,6 @@ def login_page(message=""):
             <label>パスワード</label><input type="password" name="password" placeholder="パスワード" required>
             <button type="submit">ログイン</button>
         </form>
-        <a class="btn back" href="/register">新規登録</a>
     </div>
     
     """
@@ -1299,16 +1326,20 @@ def myshift(request: Request, year: int = None, month: int = None):
 
 
 def help_segments(shifts):
-    """提出シフトから、人手不足の時間帯を30分単位でまとめる。
-    9:00-10:00 と 21:00-22:00 は最低3人、
-    それ以外の30分枠は最低1人として不足人数を出す。
+    """固定ヘルプ枠。
+    朝：09:00-10:00 を3枠
+    夜：21:00-22:00 を3枠
+
+    その時間帯に入っているシフト人数を数え、不足分だけ表示する。
+    それ以外の時間帯にはヘルプを出さない。
     """
-    slots = []
-    t = START_HOUR
-    while t < END_HOUR:
-        is_opening_hour = abs(t - START_HOUR) < 0.001
-        is_closing_hour = abs(t - (END_HOUR - 1)) < 0.001
-        requirement = 3 if (is_opening_hour or is_closing_hour) else 1
+    fixed_slots = [
+        (9.0, 10.0, 3),
+        (21.0, 22.0, 3),
+    ]
+
+    segments = []
+    for hs, he, required in fixed_slots:
         count = 0
         for r in shifts:
             if int(r["cut"] or 0) == 1:
@@ -1317,31 +1348,16 @@ def help_segments(shifts):
             en = parse_time_to_hour(r["end"])
             if st is None or en is None:
                 continue
-            if st <= t < en:
+
+            # ヘルプ時間帯と少しでも重なっている人を人数として数える
+            if st < he and en > hs:
                 count += 1
-        deficit = requirement - count
+
+        deficit = required - count
         if deficit > 0:
-            slots.append((t, deficit))
-        t += 0.5
+            segments.append((hs, he, deficit))
 
-    segments = []
-    if not slots:
-        return segments
-
-    seg_start, seg_deficit = slots[0]
-    prev_t = seg_start
-
-    for t, deficit in slots[1:]:
-        if abs(t - (prev_t + 0.5)) < 0.001 and deficit == seg_deficit:
-            prev_t = t
-        else:
-            segments.append((seg_start, prev_t + 0.5, seg_deficit))
-            seg_start, seg_deficit = t, deficit
-            prev_t = t
-
-    segments.append((seg_start, prev_t + 0.5, seg_deficit))
     return segments
-
 
 
 
@@ -1408,7 +1424,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
             f'📌{escape(short_memo(memo, 16))}</div>'
         )
     html = f"""
-    <div id="day-{day}" class="day-card {today_class}" data-today="{today_flag}">
+    <div id="day-{day}" class="day-card {today_class}" data-today="{today_flag}" data-date="{day}">
         <div class="day-head">
             <div class="day-label"><div class="dow">{weekdays[dt.weekday()]}</div><div class="date-num">{dt.day}</div>{lock}{memo_chip}</div>
             <div class="timeline-wrap"><div class="timeline">
@@ -2136,7 +2152,7 @@ def admin_publish(request: Request, year: int = None, month: int = None):
         <div><label>月</label><input type="number" name="month" value="{month}"></div>
         <button type="submit">表示</button>
     </form>
-    <table class='publish-table'><tr><th>日付</th><th>状態</th><th>操作</th><th>メモ</th></tr>
+    <table class="publish-table"><tr><th>日付</th><th>状態</th><th>操作</th><th>メモ</th></tr>
     """
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     for d in range(1, last_day + 1):
@@ -2150,11 +2166,15 @@ def admin_publish(request: Request, year: int = None, month: int = None):
         btn_class = "pub-off" if pub else "pub-on"
         memo_value = escape(get_day_memo(day))
         body += f"""<tr id="pub-row-{day}">
-            <td>{month}/{d}({weekdays[dt.weekday()]})</td>
-            <td id="pub-state-{day}" class="{state_class}">{state}</td>
-            <td><a id="pub-btn-{day}" class="btn small-btn publish-btn {btn_class}" href="/set-publish/{day}/{val}" onclick="setPublishAjax('{day}', {val}); return false;">{action}</a></td>
-            <td>
-                <form action="/set-day-memo" method="post">
+            <td style="vertical-align:middle;text-align:center;">{month}/{d}({weekdays[dt.weekday()]})</td>
+            <td style="vertical-align:middle;text-align:center;">
+                <span id="pub-state-{day}" class="{state_class}" style="display:inline-flex;align-items:center;justify-content:center;min-width:64px;height:32px;line-height:1;margin:0 auto;">{state}</span>
+            </td>
+            <td style="vertical-align:middle;text-align:center;">
+                <a id="pub-btn-{day}" class="btn small-btn publish-btn {btn_class}" href="/set-publish/{day}/{val}" onclick="setPublishAjax('{day}', {val}); return false;">{action}</a>
+            </td>
+            <td style="vertical-align:middle;text-align:left;">
+                <form action="/set-day-memo" method="post" style="margin:0;">
                     <input type="hidden" name="day" value="{day}">
                     <input type="hidden" name="year" value="{year}">
                     <input type="hidden" name="month" value="{month}">
