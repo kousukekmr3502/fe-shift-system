@@ -597,21 +597,22 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 word-break: break-all;
             }}
             .day-memo-chip:hover {{ color: var(--fe-green-dark); }}
-            .day-publish-control { display:flex; align-items:center; justify-content:flex-end; gap:8px; {
+            .day-publish-control {{
                 position: absolute;
                 right: 10px;
                 top: 34px;
                 z-index: 8;
                 display: flex;
-                gap: 6px;
+                gap: 8px;
                 align-items: center;
+                justify-content: flex-end;
                 background: rgba(255,255,255,0.92);
                 border: 1px solid var(--fe-line);
                 border-radius: 12px;
-                padding: 6px;
+                padding: 6px 8px;
                 box-shadow: 0 2px 8px rgba(0,0,0,0.08);
             }}
-            .day-publish-control .publish-state {{ font-size: 12px; min-width: 56px; }}
+            .day-publish-control .publish-state {{ font-size: 12px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
             .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 12px; padding: 6px 8px; margin: 0; }}
             .memo-modal {{
                 display: none;
@@ -900,7 +901,7 @@ def login_page(message=""):
             <label>パスワード</label><input type="password" name="password" placeholder="パスワード" required>
             <button type="submit">ログイン</button>
         </form>
-
+        <a class="btn back" href="/register">新規登録</a>
     </div>
     
     """
@@ -1870,7 +1871,7 @@ def admin_submission_status(request: Request):
     <div class="box">
         対象期間：<b>{year}年{month}月{start_day}日〜{end_day}日</b><br>
         提出締切：<b>{deadline.strftime('%Y/%m/%d')} 23:59</b><br>
-        残り時間：<b>{remaining_text}</b>
+        残り時間：<b id="admin-submission-countdown" data-deadline="{datetime.combine(deadline, datetime.max.time()).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()}">{remaining_text}</b>
     </div>
     <table>
         <tr><th>名前</th><th>ID</th><th>提出数</th><th>状態</th></tr>
@@ -1889,6 +1890,33 @@ def admin_submission_status(request: Request):
 
     body += """
     </table>
+    <script>
+    function updateAdminSubmissionCountdown(){
+        const el = document.getElementById('admin-submission-countdown');
+        if(!el) return;
+        const deadline = new Date(el.dataset.deadline);
+        let diff = Math.floor((deadline - new Date()) / 1000);
+        if(diff <= 0){
+            el.textContent = '締切を過ぎました';
+            return;
+        }
+        const days = Math.floor(diff / 86400);
+        diff %= 86400;
+        const hours = Math.floor(diff / 3600);
+        diff %= 3600;
+        const mins = Math.floor(diff / 60);
+        const secs = diff % 60;
+        if(days > 0){
+            el.textContent = `${days}日 ${hours}時間 ${mins}分`;
+        }else if(hours > 0){
+            el.textContent = `${hours}時間 ${mins}分 ${secs}秒`;
+        }else{
+            el.textContent = `${mins}分 ${secs}秒`;
+        }
+    }
+    setInterval(updateAdminSubmissionCountdown, 1000);
+    updateAdminSubmissionCountdown();
+    </script>
     <a class="btn back" href="/admin">戻る</a>
     """
     return layout("シフト提出状況", body, user=user)
@@ -2383,9 +2411,11 @@ def admin_users(request: Request):
 
     body = """
     <h2>従業員一覧</h2>
-    <div style="margin-bottom:12px;"><a class="btn confirm" href="/admin-user-new">＋ 新規従業員追加</a></div>
     <div class="box">
         従業員ごとの「編集する」ボタンから、ID・名前・パスワード・時給を変更できます。
+    </div>
+    <div style="margin:10px 0 16px 0;">
+        <a class="btn confirm" href="/admin-user-new">＋ 新規従業員追加</a>
     </div>
     """
 
@@ -2445,38 +2475,81 @@ def admin_users(request: Request):
 
 @app.get("/admin-user-new", response_class=HTMLResponse)
 def admin_user_new_page(request: Request):
-    user=require_login(request)
+    user = require_login(request)
     if not user or not is_admin_user(user):
         return redirect("/portal")
-    body="""
+
+    body = """
     <h2>新規従業員追加</h2>
-    <form action="/admin-user-new" method="post">
-    <label>名前</label><input name="name" required>
-    <label>ID</label><input name="login_id" required>
-    <label>パスワード</label><input name="password" required>
-    <label>時給</label><input type="number" name="hourly_wage" value="0">
-    <label>ステータス</label>
-    <select name="status">
-    <option>社員</option>
-    <option>オフィシャルトレーナー</option>
-    <option selected>アルバイト</option>
-    </select>
-    <button type="submit">追加する</button>
+    <div class="box">
+        管理者だけが新規従業員を追加できます。ID・パスワード・時給・ステータスを設定してください。
+    </div>
+    <form action="/admin-user-new" method="post" onsubmit="return confirm('この内容で従業員を追加しますか？');">
+        <label>名前</label>
+        <input name="name" placeholder="例：木村洸介" required>
+
+        <label>ID</label>
+        <input name="login_id" placeholder="例：01" required>
+
+        <label>パスワード</label>
+        <input name="password" placeholder="初期パスワード" required>
+
+        <label>時給</label>
+        <input type="number" name="hourly_wage" value="0" min="0">
+
+        <label>ステータス</label>
+        <select name="status">
+            <option value="社員">社員</option>
+            <option value="オフィシャルトレーナー">オフィシャルトレーナー</option>
+            <option value="アルバイト" selected>アルバイト</option>
+        </select>
+
+        <button type="submit">追加する</button>
     </form>
+    <a class="btn back" href="/admin-users">従業員一覧へ戻る</a>
     """
-    return layout("従業員追加", body, user=user)
+    return layout("新規従業員追加", body, user=user, auto_scroll=False)
+
 
 @app.post("/admin-user-new")
-def admin_user_new(request: Request,name:str=Form(...),login_id:str=Form(...),
-password:str=Form(...),hourly_wage:int=Form(0),status:str=Form("アルバイト")):
-    user=require_login(request)
+def admin_user_new_submit(
+    request: Request,
+    name: str = Form(...),
+    login_id: str = Form(...),
+    password: str = Form(...),
+    hourly_wage: int = Form(0),
+    status: str = Form("アルバイト")
+):
+    backup_before_change("before_user_add")
+    user = require_login(request)
     if not user or not is_admin_user(user):
         return redirect("/portal")
-    conn=db_connect();cur=conn.cursor()
-    cur.execute("INSERT INTO users (login_id,password,name,is_admin,hourly_wage,status) VALUES (?,?,?,?,?,?)",
-    (login_id,password,name,0,hourly_wage,status))
-    conn.commit();conn.close()
-    return redirect("/admin-users")
+
+    name = name.strip()
+    login_id = login_id.strip()
+    password = password.strip()
+    status = status.strip() or "アルバイト"
+    if status not in ["社員", "オフィシャルトレーナー", "アルバイト"]:
+        status = "アルバイト"
+
+    if not name or not login_id or not password:
+        return HTMLResponse("<script>alert('名前・ID・パスワードを入力してください。');history.back();</script>")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+        INSERT INTO users (login_id, password, name, is_admin, hourly_wage, status)
+        VALUES (?, ?, ?, 0, ?, ?)
+        """, (login_id, password, name, int(hourly_wage or 0), status))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return HTMLResponse("<script>alert('そのIDはすでに使われています。');history.back();</script>")
+    conn.close()
+
+    return HTMLResponse("<script>alert('従業員を追加しました。');location='/admin-users';</script>")
+
 
 @app.get("/admin-user-edit/{user_id}", response_class=HTMLResponse)
 def admin_user_edit_page(user_id: int, request: Request):
