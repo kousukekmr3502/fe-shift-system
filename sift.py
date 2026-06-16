@@ -597,7 +597,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 word-break: break-all;
             }}
             .day-memo-chip:hover {{ color: var(--fe-green-dark); }}
-            .day-publish-control {{
+            .day-publish-control { display:flex; align-items:center; justify-content:flex-end; gap:8px; {
                 position: absolute;
                 right: 10px;
                 top: 34px;
@@ -900,7 +900,7 @@ def login_page(message=""):
             <label>パスワード</label><input type="password" name="password" placeholder="パスワード" required>
             <button type="submit">ログイン</button>
         </form>
-        <a class="btn back" href="/register">新規登録</a>
+
     </div>
     
     """
@@ -2383,6 +2383,7 @@ def admin_users(request: Request):
 
     body = """
     <h2>従業員一覧</h2>
+    <div style="margin-bottom:12px;"><a class="btn confirm" href="/admin-user-new">＋ 新規従業員追加</a></div>
     <div class="box">
         従業員ごとの「編集する」ボタンから、ID・名前・パスワード・時給を変更できます。
     </div>
@@ -2440,6 +2441,42 @@ def admin_users(request: Request):
     """
     return layout("従業員一覧", body, user=user)
 
+
+
+@app.get("/admin-user-new", response_class=HTMLResponse)
+def admin_user_new_page(request: Request):
+    user=require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    body="""
+    <h2>新規従業員追加</h2>
+    <form action="/admin-user-new" method="post">
+    <label>名前</label><input name="name" required>
+    <label>ID</label><input name="login_id" required>
+    <label>パスワード</label><input name="password" required>
+    <label>時給</label><input type="number" name="hourly_wage" value="0">
+    <label>ステータス</label>
+    <select name="status">
+    <option>社員</option>
+    <option>オフィシャルトレーナー</option>
+    <option selected>アルバイト</option>
+    </select>
+    <button type="submit">追加する</button>
+    </form>
+    """
+    return layout("従業員追加", body, user=user)
+
+@app.post("/admin-user-new")
+def admin_user_new(request: Request,name:str=Form(...),login_id:str=Form(...),
+password:str=Form(...),hourly_wage:int=Form(0),status:str=Form("アルバイト")):
+    user=require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn=db_connect();cur=conn.cursor()
+    cur.execute("INSERT INTO users (login_id,password,name,is_admin,hourly_wage,status) VALUES (?,?,?,?,?,?)",
+    (login_id,password,name,0,hourly_wage,status))
+    conn.commit();conn.close()
+    return redirect("/admin-users")
 
 @app.get("/admin-user-edit/{user_id}", response_class=HTMLResponse)
 def admin_user_edit_page(user_id: int, request: Request):
