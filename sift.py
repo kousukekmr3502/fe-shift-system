@@ -1395,7 +1395,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
     dt = date.fromisoformat(day)
     weekdays = ["月", "火", "水", "木", "金", "土", "日"]
     today_flag = "1" if day == date.today().isoformat() else "0"
-    today_class = "today" if today_flag == "1" else ""
+    today_class = "today" if day == date.today().isoformat() else ""
     lock = "" if published or admin or manage else '<div class="lock-mark">🔒</div>'
     memo = get_day_memo(day)
     memo_chip = ""
