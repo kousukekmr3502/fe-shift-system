@@ -1,4 +1,3 @@
-
 # ============================================================
 # FE Portal Version 5
 # 重要：fe_portal.db に従業員・シフト・時給などが保存されます。
@@ -793,15 +792,15 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
 
         
             .publish-table th,
-            .publish-table td {
+            .publish-table td {{
                 vertical-align: middle !important;
                 text-align: center !important;
-            }
-            .publish-status-cell {
+            }}
+            .publish-status-cell {{
                 height: 100%;
                 padding: 0 !important;
-            }
-            .publish-status-cell .publish-state {
+            }}
+            .publish-status-cell .publish-state {{
                 display: inline-flex !important;
                 align-items: center !important;
                 justify-content: center !important;
@@ -812,13 +811,13 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 border-radius: 999px;
                 font-size: 13px;
                 font-weight: 900;
-            }
-            .publish-memo-cell {
+            }}
+            .publish-memo-cell {{
                 text-align: left !important;
-            }
-            .publish-memo-cell form {
+            }}
+            .publish-memo-cell form {{
                 margin: 0;
-            }
+            }}
 
         </style>
     </head>
@@ -905,7 +904,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 const yyyy = now.getFullYear();
                 const mm = String(now.getMonth() + 1).padStart(2, '0');
                 const dd = String(now.getDate()).padStart(2, '0');
-                const localToday = `${yyyy}-${mm}-${dd}`;
+                const localToday = `${{yyyy}}-${{mm}}-${{dd}}`;
 
                 document.querySelectorAll('.day-card.today').forEach(el => el.classList.remove('today'));
                 const localTodayCard = document.querySelector(`[data-date="${localToday}"]`);
