@@ -902,7 +902,7 @@ def login_page(message=""):
         </form>
         <a class="btn back" href="/register">新規登録</a>
     </div>
-    <div class="box">管理者ログイン：ID <b>admin</b> / パスワード <b>4423Kimura</b></div>
+    
     """
     return layout("FE Portal ログイン", body, user=None, show_nav=False)
 
@@ -1087,18 +1087,64 @@ def shift(request: Request, saved: int = 0):
     msg = '<div class="message">シフト提出済み</div>' if saved else ""
     button_class = "submitted-btn" if saved_rows else ""
     button_text = "提出済み" if saved_rows else "提出する"
+    deadline_iso = datetime.combine(deadline, datetime.max.time()).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
     body = f"""
     <h2>シフト提出</h2>
     {msg}
-    <div class="box"><div>提出締切</div><div class="deadline">{deadline.strftime('%Y/%m/%d')} 23:59</div><div>残り時間</div><div class="summary-num">{remaining_text}</div></div>
+    <div class="box">
+        <div>提出締切</div>
+        <div class="deadline">{deadline.strftime('%Y/%m/%d')} 23:59</div>
+        <div>残り時間</div>
+        <div id="shift-countdown" class="summary-num" data-deadline="{deadline_iso}">{remaining_text}</div>
+    </div>
     <div class="box"><b>提出対象</b><br>{year}年{month}月{start_day}日〜{end_day}日</div>
-    <form action="/shift-submit" method="post">
+    <form action="/shift-submit" method="post" onsubmit="return preventDoubleSubmit(this);">
         <label>名前</label><input value="{escape(user['name'])}" readonly style="background:#f0f0f0; color:#555;">
         <br><br>{rows}
         <label>メモ</label><textarea name="memo" placeholder="終電、テスト期間など"></textarea>
         <button class="{button_class}" type="submit">{button_text}</button>
     </form>
     <a class="btn back" href="/portal">戻る</a>
+
+    <script>
+    function updateShiftCountdown() {{
+        const el = document.getElementById("shift-countdown");
+        if (!el) return;
+        const deadline = new Date(el.dataset.deadline);
+        const now = new Date();
+        let diff = Math.floor((deadline - now) / 1000);
+        if (diff <= 0) {{
+            el.textContent = "締切を過ぎました";
+            return;
+        }}
+        const days = Math.floor(diff / 86400);
+        diff %= 86400;
+        const hours = Math.floor(diff / 3600);
+        diff %= 3600;
+        const mins = Math.floor(diff / 60);
+        const secs = diff % 60;
+        if (days > 0) {{
+            el.textContent = `${{days}}日 ${{hours}}時間 ${{mins}}分`;
+        }} else if (hours > 0) {{
+            el.textContent = `${{hours}}時間 ${{mins}}分 ${{secs}}秒`;
+        }} else {{
+            el.textContent = `${{mins}}分 ${{secs}}秒`;
+        }}
+    }}
+    setInterval(updateShiftCountdown, 1000);
+    updateShiftCountdown();
+
+    function preventDoubleSubmit(form) {{
+        const btn = form.querySelector('button[type="submit"]');
+        if (btn) {{
+            if (btn.dataset.submitted === "1") return false;
+            btn.dataset.submitted = "1";
+            btn.disabled = true;
+            btn.textContent = "送信中...";
+        }}
+        return true;
+    }}
+    </script>
     """
     return layout("シフト提出", body, user=user)
 
@@ -1113,7 +1159,15 @@ async def shift_submit(request: Request):
     memo = form.get("memo", "")
     selected_dates = set(form.getlist("selected_dates"))
     year, month, start_day, end_day, _, _ = get_shift_period()
-    conn = db_connect(); cur = conn.cursor()
+    start_date = f"{year}-{month:02d}-{start_day:02d}"
+    end_date = f"{year}-{month:02d}-{end_day:02d}"
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    # 二重クリック・連続送信で通常提出バーが増えないように、書き込みをロックしてから更新する。
+    cur.execute("BEGIN IMMEDIATE")
+
     for d in range(start_day, end_day + 1):
         date_value = f"{year}-{month:02d}-{d:02d}"
         start = form.get(f"start_{date_value}", "")
@@ -1121,7 +1175,7 @@ async def shift_submit(request: Request):
         limit_hour = form.get(f"limit_{date_value}", "指定しない")
         should_save = date_value in selected_dates or start or end or limit_hour not in ("", "指定しない")
 
-        # 通常提出分だけ更新する。管理者追加・ヘルプ承認などの確定シフトは消さない。
+        # 通常提出分だけ入れ替える。管理者追加・ヘルプ承認などの確定シフトは消さない。
         cur.execute("""
         DELETE FROM shifts
         WHERE user_id = ? AND date = ?
@@ -1134,7 +1188,27 @@ async def shift_submit(request: Request):
             INSERT INTO shifts (user_id, name, date, start, end, limit_hour, memo, confirmed, cut, cut_memo)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '')
             """, (user["login_id"], name, date_value, start, end, limit_hour, memo))
-    conn.commit(); conn.close()
+
+    # 万が一、過去の二重送信で重複している通常提出があれば、同じ日付につき最新1件だけ残す。
+    cur.execute("""
+    DELETE FROM shifts
+    WHERE user_id = ?
+      AND date BETWEEN ? AND ?
+      AND IFNULL(confirmed, 0) = 0
+      AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
+      AND id NOT IN (
+          SELECT MAX(id)
+          FROM shifts
+          WHERE user_id = ?
+            AND date BETWEEN ? AND ?
+            AND IFNULL(confirmed, 0) = 0
+            AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
+          GROUP BY user_id, date
+      )
+    """, (user["login_id"], start_date, end_date, user["login_id"], start_date, end_date))
+
+    conn.commit()
+    conn.close()
     return redirect("/shift?saved=1")
 
 
