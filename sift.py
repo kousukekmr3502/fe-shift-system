@@ -19,10 +19,7 @@ from io import BytesIO
 
 
 app = FastAPI()
-
-DATA_DIR = Path("/Users/kimurakousuke/Library/Mobile Documents/com~apple~CloudDocs/FE_PORTAL_DATA")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
+DATA_DIR = Path(".")
 DB = str(DATA_DIR / "fe_portal.db")
 ADMIN_ID = "admin"
 ADMIN_PASSWORD = "4423Kimura"
