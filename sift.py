@@ -1034,7 +1034,7 @@ def register_page():
     <div class="logo-title">新規登録</div>
     <div class="login-card">
         <form action="/register" method="post">
-            <label>名前</label><input name="name" placeholder="例：木村洸介" required>
+            <label>名前</label><input name="name" placeholder="例：山田太郎" required>
             <label>ID</label><input name="login_id" placeholder="ログインに使うID" required>
             <label>パスワード</label><input type="password" name="password" placeholder="パスワード" required>
             <button type="submit">登録する</button>
@@ -2465,11 +2465,8 @@ def admin_users(request: Request):
         emp_status = r["status"] if "status" in r.keys() and r["status"] else "アルバイト"
 
         admin_actions = ""
+        admin_badge = ' <span style="display:inline-block;background:#111;color:#fff;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:900;vertical-align:middle;">管理者</span>' if int(r["is_admin"] or 0) == 1 else ""
         if r["login_id"] != user["login_id"]:
-            if int(r["is_admin"] or 0) == 1:
-                admin_actions += f'<a class="btn danger small-btn" href="/revoke-admin/{r["id"]}" onclick="saveScrollNow()">権限剥奪</a>'
-            else:
-                admin_actions += f'<a class="btn small-btn" href="/grant-admin/{r["id"]}" onclick="saveScrollNow()">管理者にする</a>'
             admin_actions += f'<a class="btn danger small-btn" href="/delete-user-confirm/{r["id"]}" onclick="saveScrollNow()">従業員削除</a>'
         else:
             admin_actions += '<span style="font-weight:bold;color:#777;">自分自身は削除不可</span>'
@@ -2479,7 +2476,7 @@ def admin_users(request: Request):
             <div style="width:100%;">
                 <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
                     <div>
-                        <div style="font-size:20px;font-weight:900;">{escape(r['name'])}</div>
+                        <div style="font-size:20px;font-weight:900;">{escape(r['name'])}{admin_badge}</div>
                         <div>ID：<b>{escape(r['login_id'])}</b></div>
                         <div>権限：<b>{role}</b></div>
                         <div>ステータス：<b>{escape(emp_status)}</b></div>
@@ -2526,7 +2523,7 @@ def admin_user_new_page(request: Request):
     </div>
     <form action="/admin-user-new" method="post" onsubmit="return confirm('この内容で従業員を追加しますか？');">
         <label>名前</label>
-        <input name="name" placeholder="例：木村洸介" required>
+        <input name="name" placeholder="例：山田太郎" required>
 
         <label>ID</label>
         <input name="login_id" placeholder="例：01" required>
@@ -2639,16 +2636,72 @@ def admin_user_edit_page(user_id: int, request: Request):
         <input type="number" name="hourly_wage" value="{wage}" min="0" placeholder="例：1200">
 
         <div class="box">
-            現在の権限：<b>{role}</b><br>
-            権限変更は従業員一覧の「管理者にする / 権限剥奪」ボタンから行えます。
+            現在の権限：<b>{role}</b>
         </div>
 
         <button type="submit">保存する</button>
     </form>
 
+    <div class="box" style="margin-top:18px;">
+        <h3 style="margin-top:0;">管理者権限</h3>
+        <p style="font-weight:800;color:#555;">管理者権限の付与・剥奪には管理者パスワードが必要です。</p>
+        <form action="/admin-user-admin-change/{user_id}" method="post" onsubmit="return confirm('管理者権限を変更しますか？');">
+            <label>管理者パスワード</label>
+            <input type="password" name="admin_password" placeholder="管理者パスワード" required>
+            <input type="hidden" name="action" value="{'revoke' if int(target['is_admin'] or 0) == 1 else 'grant'}">
+            <button class="{'danger' if int(target['is_admin'] or 0) == 1 else 'confirm'}" type="submit">
+                {'管理者権限を剥奪する' if int(target['is_admin'] or 0) == 1 else '管理者にする'}
+            </button>
+        </form>
+    </div>
+
     <a class="btn back" href="/admin-users">従業員一覧へ戻る</a>
     """
     return layout("従業員情報編集", body, user=user)
+
+
+
+@app.post("/admin-user-admin-change/{user_id}")
+def admin_user_admin_change(
+    user_id: int,
+    request: Request,
+    action: str = Form(""),
+    admin_password: str = Form("")
+):
+    backup_before_change("before_admin_change")
+    user = require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    if admin_password != ADMIN_PASSWORD:
+        return HTMLResponse("<script>alert('管理者パスワードが違います。');history.back();</script>")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+    if not target:
+        conn.close()
+        return redirect("/admin-users")
+
+    # 自分自身の管理者権限を剥奪すると管理不能になるため禁止
+    if target["login_id"] == user["login_id"] and action == "revoke":
+        conn.close()
+        return HTMLResponse("<script>alert('自分自身の管理者権限は剥奪できません。');history.back();</script>")
+
+    if action == "grant":
+        cur.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+        msg = "管理者権限を付与しました。"
+    elif action == "revoke":
+        cur.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,))
+        msg = "管理者権限を剥奪しました。"
+    else:
+        conn.close()
+        return HTMLResponse("<script>alert('操作が不正です。');history.back();</script>")
+
+    conn.commit()
+    conn.close()
+    return HTMLResponse(f"<script>alert('{msg}');location='/admin-user-edit/{user_id}';</script>")
 
 
 @app.post("/admin-user-edit/{user_id}")
@@ -2917,22 +2970,22 @@ def delete_user(user_id: int, request: Request, confirm_text: str = Form("")):
 
 @app.get("/grant-admin/{user_id}")
 def grant_admin(user_id: int, request: Request):
-    backup_before_change("before_admin_change")
+    # パスワードなしのURL直打ちによる権限変更は禁止。
+    # 権限変更は /admin-user-edit/{user_id} の下部フォームから行う。
     user = require_login(request)
     if not user or not is_admin_user(user):
         return redirect("/portal")
-    conn = db_connect(); cur = conn.cursor(); cur.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,)); conn.commit(); conn.close()
-    return redirect("/admin-users")
+    return HTMLResponse("<script>alert('管理者権限の変更は、従業員編集画面から管理者パスワードを入力して行ってください。');location='/admin-user-edit/%s';</script>" % user_id)
 
 
 @app.get("/revoke-admin/{user_id}")
 def revoke_admin(user_id: int, request: Request):
-    backup_before_change("before_admin_change")
+    # パスワードなしのURL直打ちによる権限変更は禁止。
+    # 権限変更は /admin-user-edit/{user_id} の下部フォームから行う。
     user = require_login(request)
     if not user or not is_admin_user(user):
         return redirect("/portal")
-    conn = db_connect(); cur = conn.cursor(); cur.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,)); conn.commit(); conn.close()
-    return redirect("/admin-users")
+    return HTMLResponse("<script>alert('管理者権限の変更は、従業員編集画面から管理者パスワードを入力して行ってください。');location='/admin-user-edit/%s';</script>" % user_id)
 
 
 @app.get("/admin-opinions", response_class=HTMLResponse)
