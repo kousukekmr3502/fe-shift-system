@@ -1223,11 +1223,12 @@ async def shift_submit(request: Request):
         limit_hour = form.get(f"limit_{date_value}", "指定しない")
         should_save = date_value in selected_dates or start or end or limit_hour not in ("", "指定しない")
 
-        # 通常提出分だけ入れ替える。管理者追加・ヘルプ承認などの確定シフトは消さない。
+        # 再提出時は、同じ人・同じ日の通常提出シフトを丸ごと入れ替える。
+        # すでに管理者が「確定」していても、従業員が再提出したら古い確定バーは消して新しい提出だけ残す。
+        # ただし、管理者追加・ヘルプ承認で作られた特殊シフトは消さない。
         cur.execute("""
         DELETE FROM shifts
         WHERE user_id = ? AND date = ?
-          AND IFNULL(confirmed, 0) = 0
           AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
         """, (user["login_id"], date_value))
 
@@ -1237,19 +1238,18 @@ async def shift_submit(request: Request):
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '')
             """, (user["login_id"], name, date_value, start, end, limit_hour, memo))
 
-    # 万が一、過去の二重送信で重複している通常提出があれば、同じ日付につき最新1件だけ残す。
+    # 万が一、過去の再提出や二重送信で重複している通常提出があれば、同じ日付につき最新1件だけ残す。
+    # 確定済み通常シフトも重複整理の対象にする。特殊シフトは残す。
     cur.execute("""
     DELETE FROM shifts
     WHERE user_id = ?
       AND date BETWEEN ? AND ?
-      AND IFNULL(confirmed, 0) = 0
       AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
       AND id NOT IN (
           SELECT MAX(id)
           FROM shifts
           WHERE user_id = ?
             AND date BETWEEN ? AND ?
-            AND IFNULL(confirmed, 0) = 0
             AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
           GROUP BY user_id, date
       )
