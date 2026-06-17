@@ -20,13 +20,27 @@ from io import BytesIO
 
 app = FastAPI()
 
-# Render運用では、DATA_DIR=/var/data を環境変数に設定すると
-# DB・バックアップ・users_backup.json を永続Diskに保存できます。
-# ローカルや環境変数未設定時は、これまで通り sift.py と同じ場所に保存します。
-DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+# =========================
+# DB保存先設定（Render Disk対応）
+# =========================
+# RenderのEnvironmentで DATA_DIR=/var/data を設定すると、
+# fe_portal.db / バックアップ / users_backup.json が永続Diskに保存されます。
+# 未設定ならローカル確認用として、sift.py と同じフォルダを使います。
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(APP_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB = str(DATA_DIR / "fe_portal.db")
+DB_PATH = DATA_DIR / "fe_portal.db"
+BUNDLED_DB_PATH = APP_DIR / "fe_portal.db"
+
+# 初回だけ：GitHubに同梱されている fe_portal.db があり、
+# まだDisk側にDBが無い場合だけコピーします。
+# 既に /var/data/fe_portal.db がある場合は絶対に上書きしません。
+if not DB_PATH.exists() and BUNDLED_DB_PATH.exists() and BUNDLED_DB_PATH.resolve() != DB_PATH.resolve():
+    shutil.copy2(BUNDLED_DB_PATH, DB_PATH)
+    print(f"[db initialized] copied bundled DB to {DB_PATH}")
+
+DB = str(DB_PATH)
 ADMIN_ID = "admin"
 ADMIN_PASSWORD = "4423Kimura"
 START_HOUR = 9
