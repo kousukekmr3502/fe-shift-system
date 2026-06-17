@@ -617,20 +617,20 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 word-break: break-all;
             }}
             .day-memo-chip:hover {{ color: var(--fe-green-dark); }}
+            .day-main {{
+                min-width: 0;
+            }}
             .day-publish-control {{
-                position: absolute;
-                right: 10px;
-                top: 34px;
+                position: static;
                 z-index: 8;
                 display: flex;
                 gap: 8px;
                 align-items: center;
                 justify-content: flex-end;
-                background: rgba(255,255,255,0.92);
-                border: 1px solid var(--fe-line);
-                border-radius: 12px;
-                padding: 6px 8px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+                background: rgba(255,255,255,0.96);
+                border-bottom: 1px solid var(--fe-line);
+                padding: 8px 10px;
+                box-shadow: none;
             }}
             .day-publish-control .publish-state {{ font-size: 12px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
             .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 12px; padding: 6px 8px; margin: 0; }}
@@ -1447,11 +1447,8 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
     <div id="day-{day}" class="day-card {today_class}" data-today="{today_flag}" data-date="{day}">
         <div class="day-head">
             <div class="day-label"><div class="dow">{weekdays[dt.weekday()]}</div><div class="date-num">{dt.day}</div>{lock}{memo_chip}</div>
-            <div class="timeline-wrap"><div class="timeline">
+            <div class="day-main">
     """
-    for h in range(START_HOUR, END_HOUR + 1):
-        left = (h - START_HOUR) * PX_PER_HOUR
-        html += f'<div class="time-line" style="left:{left}px;"></div><div class="time-label" style="left:{left + 4}px;">{h}</div>'
 
     if manage:
         pub = is_published(day)
@@ -1468,6 +1465,15 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
             <a class="btn small-btn confirm" href="{add_url}">＋追加</a>
         </div>
         """
+
+    html += """
+            <div class="timeline-wrap"><div class="timeline">
+    """
+    for h in range(START_HOUR, END_HOUR + 1):
+        left = (h - START_HOUR) * PX_PER_HOUR
+        html += f'<div class="time-line" style="left:{left}px;"></div><div class="time-label" style="left:{left + 4}px;">{h}</div>'
+
+
 
     visible = (published or admin or manage)
     if not visible:
@@ -1563,7 +1569,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
         if help_y > 190:
             html += f'<style>.day-card[data-today="{today_flag}"] .timeline {{ min-height: {help_y + 40}px; }}</style>'
 
-    html += "</div></div></div></div>"
+    html += "</div></div></div></div></div>"
     return html
 
 
