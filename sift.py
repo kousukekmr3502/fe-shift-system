@@ -19,7 +19,13 @@ from io import BytesIO
 
 
 app = FastAPI()
-DATA_DIR = Path(".")
+
+# Render運用では、DATA_DIR=/var/data を環境変数に設定すると
+# DB・バックアップ・users_backup.json を永続Diskに保存できます。
+# ローカルや環境変数未設定時は、これまで通り sift.py と同じ場所に保存します。
+DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 DB = str(DATA_DIR / "fe_portal.db")
 ADMIN_ID = "admin"
 ADMIN_PASSWORD = "4423Kimura"
