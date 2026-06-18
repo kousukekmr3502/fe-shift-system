@@ -3272,7 +3272,7 @@ def admin_export_excel(request: Request, year: int = None, month: int = None):
         ・朝/夜などの人員不足メモ<br>
         ・日付メモ<br>
         ・集計シート（従業員別の合計時間）<br>
-        ・セルサイズはそのまま、文字は見やすく大きめ
+        
     </div>
 
     <a class="btn back" href="/admin">戻る</a>
