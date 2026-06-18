@@ -565,12 +565,12 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 border: 2px solid rgba(17,17,17,0.16);
                 border-radius: 999px;
                 padding: 7px 10px;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 900;
                 white-space: nowrap;
                 flex: 0 0 auto;
             }}
-            .userbar {{ background: white; padding: 10px 16px; font-size: 12px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
+            .userbar {{ background: white; padding: 10px 16px; font-size: 11px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
             .userbar a {{ color: var(--fe-green-dark); font-weight: bold; }}
             .container {{ padding: 18px; max-width: 980px; margin: auto; }}
             .logo-title {{ text-align: center; font-size: 34px; font-weight: 900; margin: 30px 0 20px; }}
@@ -584,7 +584,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .back {{ background: #666; color: white; }}
             .danger {{ background: var(--fe-red); color: white; }}
             .confirm {{ background: var(--fe-green-dark); color: white; }}
-            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 12px; border-radius: 10px; }}
+            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 11px; border-radius: 10px; }}
             .pub-on {{ background: var(--fe-green-dark) !important; color: white !important; border: 2px solid var(--fe-green-dark); }}
             .pub-off {{ background: #f2f2f2 !important; color: #555 !important; border: 2px solid #bbb; }}
             .state-on {{ color: var(--fe-green-dark); font-weight: 900; }}
@@ -632,8 +632,8 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 padding: 8px 10px;
                 box-shadow: none;
             }}
-            .day-publish-control .publish-state {{ font-size: 12px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
-            .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 12px; padding: 6px 8px; margin: 0; }}
+            .day-publish-control .publish-state {{ font-size: 11px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
+            .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 11px; padding: 6px 8px; margin: 0; }}
             .memo-modal {{
                 display: none;
                 position: fixed;
@@ -659,7 +659,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 190px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
-            .bar {{ position: absolute; height: 22px; border-radius: 6px; color: white; font-size: 12px; font-weight: bold; padding: 0 6px; line-height: 22px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
+            .bar {{ position: absolute; height: 22px; border-radius: 5px; color: white; font-size: 11px; font-weight: bold; padding: 0 5px; line-height: 20px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
             .bar.pending {{ opacity: 0.45; border: 2px dashed rgba(0,0,0,0.35); }}
             .bar.gray {{ background: var(--fe-gray); color: transparent; }}
             .bar.cut {{ opacity: 0.7; text-decoration: line-through; color: #111; background: #ddd !important; border: 2px solid var(--fe-red); }}
@@ -669,7 +669,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .help-note {{ background:#fff2d6; border-left:6px solid #f5a623; padding:10px; border-radius:12px; margin-bottom:12px; font-weight:bold; }}
             .action-panel {{ display: none; position: absolute; z-index: 9; background: white; border: 2px solid var(--fe-green-dark); border-radius: 12px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.2); min-width: 150px; }}
             .action-panel.show {{ display: block; }}
-            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 6px; }}
+            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 5px; }}
             .lock-mark {{ color: var(--fe-red); font-size: 26px; margin-top: 8px; }}
             .empty-note {{ position: absolute; left: 12px; top: 60px; color: #999; font-weight: bold; }}
             .summary {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
@@ -682,7 +682,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .cal-day {{ min-height: 74px; background: white; border: 1px solid var(--fe-line); border-radius: 10px; padding: 6px; font-size: 13px; }}
             .cal-day.today {{ border: 3px solid var(--fe-green-dark); }}
             .cal-date {{ font-weight: 900; margin-bottom: 4px; }}
-            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 6px; padding: 3px; font-size: 12px; font-weight: 800; }}
+            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 5px; padding: 3px; font-size: 11px; font-weight: 800; }}
             .employee-row {{ display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }}
             .footer-nav {{ position: fixed; left: 0; right: 0; bottom: 0; background: white; border-top: 1px solid #ddd; display: grid; grid-template-columns: repeat(5, 1fr); z-index: 20; }}
             .footer-nav a {{ text-align: center; padding: 10px 4px; color: #111; text-decoration: none; font-weight: bold; font-size: 13px; }}
@@ -730,11 +730,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             @media screen and (max-width: 650px) {{
                 .container {{ padding: 14px; }}
                 .shift-row {{ grid-template-columns: 30px 85px 1fr 1fr 92px; gap: 6px; }}
-                input, select {{ font-size: 12px; padding: 10px 6px; }}
-                .date-link {{ font-size: 12px; }}
+                input, select {{ font-size: 11px; padding: 10px 6px; }}
+                .date-link {{ font-size: 11px; }}
                 .month-form {{ grid-template-columns: 1fr 1fr; }} .month-form button {{ grid-column: 1 / -1; }}
                 .day-head {{ grid-template-columns: 80px 1fr; }}
-                .calendar {{ gap: 3px; }} .cal-day {{ min-height: 64px; padding: 4px; font-size: 12px; }}
+                .calendar {{ gap: 3px; }} .cal-day {{ min-height: 64px; padding: 4px; font-size: 11px; }}
                 header {{ padding: 12px 10px; }}
                 .brand-box {{ width: 36px; height: 36px; font-size: 15px; border-radius: 11px; }}
                 .header-title {{ font-size: 20px; }}
@@ -750,11 +750,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 right: 10px;
                 min-width: 26px;
                 height: 26px;
-                padding: 0 6px;
+                padding: 0 5px;
                 border-radius: 999px;
                 background: #e60012;
                 color: #fff;
-                font-size: 12px;
+                font-size: 11px;
                 line-height: 26px;
                 font-weight: 1000;
                 box-shadow: 0 2px 8px rgba(0,0,0,.22);
@@ -775,11 +775,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 right: 10px;
                 min-width: 26px;
                 height: 26px;
-                padding: 0 6px;
+                padding: 0 5px;
                 border-radius: 999px;
                 background: #e60012;
                 color: #fff;
-                font-size: 12px;
+                font-size: 11px;
                 line-height: 26px;
                 font-weight: 1000;
                 box-shadow: 0 2px 8px rgba(0,0,0,.22);
@@ -1482,7 +1482,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
         html += '<div class="empty-note">シフトなし</div>'
 
     colors = ["#8ac053", "#4fa3a5", "#6b7fd7", "#9b65c9", "#d6b936", "#333333"]
-    y = 36
+    y = 30
 
     if visible:
         sorted_shifts = sorted(
@@ -1519,7 +1519,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                 q = f"?year={year}&month={month}" if year and month else ""
                 html += f"""
                 <a class="bar{bar_state_class}{employee_class}" href="javascript:void(0)" onclick="toggleAction('{panel_id}')" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</a>
-                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 32}px;">
+                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 26}px;">
                     <b>{escape(r['name'])}</b><br>
                     {escape(r['start'] or '--:--')} - {escape(r['end'] or '--:--')}<br>
                     <a class="btn confirm" href="/confirm-shift/{r['id']}{q}">確定</a>
@@ -1529,10 +1529,10 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                 """
             else:
                 html += f'<div class="bar{bar_state_class}{employee_class}" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</div>'
-            y += 34
+            y += 24
 
         # ヘルプ応募中バーを表示
-        app_y = max(y + 8, 138)
+        app_y = max(y + 6, 118)
         for app in help_apps:
             st = parse_time_to_hour(app["start"])
             en = parse_time_to_hour(app["end"])
@@ -1550,10 +1550,10 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                     html += f'<a class="bar help-app" href="/cancel-help/{app["id"]}" style="left:{left}px; top:{app_y}px; width:{width}px;">応募中 取消</a>'
                 else:
                     html += f'<div class="bar help-app" style="left:{left}px; top:{app_y}px; width:{width}px;">応募あり</div>'
-            app_y += 34
+            app_y += 24
 
         # 不足人数ぶん、赤いヘルプバーを複数本表示
-        help_y = max(app_y + 8, 138)
+        help_y = max(app_y + 6, 118)
         for hs, he, deficit in help_segments(shifts):
             left = (hs - START_HOUR) * PX_PER_HOUR
             width = max((he - hs) * PX_PER_HOUR, 70)
@@ -1565,9 +1565,9 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                     start_s = fmt_hour(hs)
                     end_s = fmt_hour(he)
                     html += f'<a class="bar help-slot" href="/help-apply?year={year}&month={month}&date={day}&start={start_s}&end={end_s}&slot={n+1}" style="left:{left}px; top:{help_y}px; width:{width}px;">{label}</a>'
-                help_y += 34
-        if help_y > 190:
-            html += f'<style>.day-card[data-today="{today_flag}"] .timeline {{ min-height: {help_y + 40}px; }}</style>'
+                help_y += 24
+        if help_y > 165:
+            html += f'<style>.day-card[data-today="{today_flag}"] .timeline {{ min-height: {help_y + 28}px; }}</style>'
 
     html += "</div></div></div></div></div>"
     return html
