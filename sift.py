@@ -570,7 +570,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 white-space: nowrap;
                 flex: 0 0 auto;
             }}
-            .userbar {{ background: white; padding: 10px 16px; font-size: 14px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
+            .userbar {{ background: white; padding: 10px 16px; font-size: 12px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
             .userbar a {{ color: var(--fe-green-dark); font-weight: bold; }}
             .container {{ padding: 18px; max-width: 980px; margin: auto; }}
             .logo-title {{ text-align: center; font-size: 34px; font-weight: 900; margin: 30px 0 20px; }}
@@ -584,7 +584,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .back {{ background: #666; color: white; }}
             .danger {{ background: var(--fe-red); color: white; }}
             .confirm {{ background: var(--fe-green-dark); color: white; }}
-            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 14px; border-radius: 10px; }}
+            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 12px; border-radius: 10px; }}
             .pub-on {{ background: var(--fe-green-dark) !important; color: white !important; border: 2px solid var(--fe-green-dark); }}
             .pub-off {{ background: #f2f2f2 !important; color: #555 !important; border: 2px solid #bbb; }}
             .state-on {{ color: var(--fe-green-dark); font-weight: 900; }}
@@ -659,7 +659,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 190px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
-            .bar {{ position: absolute; height: 30px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 30px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
+            .bar {{ position: absolute; height: 22px; border-radius: 6px; color: white; font-size: 12px; font-weight: bold; padding: 0 6px; line-height: 22px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
             .bar.pending {{ opacity: 0.45; border: 2px dashed rgba(0,0,0,0.35); }}
             .bar.gray {{ background: var(--fe-gray); color: transparent; }}
             .bar.cut {{ opacity: 0.7; text-decoration: line-through; color: #111; background: #ddd !important; border: 2px solid var(--fe-red); }}
@@ -669,7 +669,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .help-note {{ background:#fff2d6; border-left:6px solid #f5a623; padding:10px; border-radius:12px; margin-bottom:12px; font-weight:bold; }}
             .action-panel {{ display: none; position: absolute; z-index: 9; background: white; border: 2px solid var(--fe-green-dark); border-radius: 12px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.2); min-width: 150px; }}
             .action-panel.show {{ display: block; }}
-            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 8px; }}
+            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 6px; }}
             .lock-mark {{ color: var(--fe-red); font-size: 26px; margin-top: 8px; }}
             .empty-note {{ position: absolute; left: 12px; top: 60px; color: #999; font-weight: bold; }}
             .summary {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
@@ -682,7 +682,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .cal-day {{ min-height: 74px; background: white; border: 1px solid var(--fe-line); border-radius: 10px; padding: 6px; font-size: 13px; }}
             .cal-day.today {{ border: 3px solid var(--fe-green-dark); }}
             .cal-date {{ font-weight: 900; margin-bottom: 4px; }}
-            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 8px; padding: 3px; font-size: 12px; font-weight: 800; }}
+            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 6px; padding: 3px; font-size: 12px; font-weight: 800; }}
             .employee-row {{ display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }}
             .footer-nav {{ position: fixed; left: 0; right: 0; bottom: 0; background: white; border-top: 1px solid #ddd; display: grid; grid-template-columns: repeat(5, 1fr); z-index: 20; }}
             .footer-nav a {{ text-align: center; padding: 10px 4px; color: #111; text-decoration: none; font-weight: bold; font-size: 13px; }}
@@ -730,8 +730,8 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             @media screen and (max-width: 650px) {{
                 .container {{ padding: 14px; }}
                 .shift-row {{ grid-template-columns: 30px 85px 1fr 1fr 92px; gap: 6px; }}
-                input, select {{ font-size: 14px; padding: 10px 6px; }}
-                .date-link {{ font-size: 14px; }}
+                input, select {{ font-size: 12px; padding: 10px 6px; }}
+                .date-link {{ font-size: 12px; }}
                 .month-form {{ grid-template-columns: 1fr 1fr; }} .month-form button {{ grid-column: 1 / -1; }}
                 .day-head {{ grid-template-columns: 80px 1fr; }}
                 .calendar {{ gap: 3px; }} .cal-day {{ min-height: 64px; padding: 4px; font-size: 12px; }}
@@ -750,11 +750,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 right: 10px;
                 min-width: 26px;
                 height: 26px;
-                padding: 0 8px;
+                padding: 0 6px;
                 border-radius: 999px;
                 background: #e60012;
                 color: #fff;
-                font-size: 14px;
+                font-size: 12px;
                 line-height: 26px;
                 font-weight: 1000;
                 box-shadow: 0 2px 8px rgba(0,0,0,.22);
@@ -775,11 +775,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 right: 10px;
                 min-width: 26px;
                 height: 26px;
-                padding: 0 8px;
+                padding: 0 6px;
                 border-radius: 999px;
                 background: #e60012;
                 color: #fff;
-                font-size: 14px;
+                font-size: 12px;
                 line-height: 26px;
                 font-weight: 1000;
                 box-shadow: 0 2px 8px rgba(0,0,0,.22);
