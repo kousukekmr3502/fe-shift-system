@@ -673,11 +673,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             table {{ width: 100%; border-collapse: collapse; background: white; }}
             th, td {{ border: 1px solid #ddd; padding: 10px; text-align: center; }} th {{ background: #f1f6e0; }}
             .month-form {{ display: grid; grid-template-columns: 1fr 1fr 100px; gap: 8px; align-items: end; }}
-            .day-card {{ background: white; border-radius: 16px; margin-bottom: 12px; box-shadow: 0 3px 12px rgba(0,0,0,0.12); overflow: hidden; border: 2px solid var(--fe-line); }}
+            .day-card {{ background: white; border-radius: 14px; margin-bottom: 8px; box-shadow: 0 3px 12px rgba(0,0,0,0.12); overflow: hidden; border: 2px solid var(--fe-line); }}
             .day-card.today {{ border: 4px solid var(--fe-green-dark) !important; box-shadow: 0 0 0 3px rgba(166,206,57,0.28), 0 3px 12px rgba(0,0,0,0.12); }}
-            .day-head {{ display: grid; grid-template-columns: 74px 1fr; border-bottom: 1px solid #ddd; }}
-            .day-label {{ background: #f5f5f5; text-align: center; padding: 8px 4px; font-size: 18px; font-weight: 900; border-right: 1px solid #ddd; }}
-            .day-label .dow {{ font-size: 22px; }} .day-label .date-num {{ font-size: 24px; margin-top: 4px; }}
+            .day-head {{ display: grid; grid-template-columns: 58px 1fr; border-bottom: 1px solid #ddd; }}
+            .day-label {{ background: #f5f5f5; text-align: center; padding: 5px 3px; font-size: 15px; font-weight: 900; border-right: 1px solid #ddd; }}
+            .day-label .dow {{ font-size: 19px; }} .day-label .date-num {{ font-size: 23px; margin-top: 1px; }}
             .day-memo-chip {{
                 margin-top: 8px;
                 font-size: 13px;
@@ -727,10 +727,10 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .memo-close-x {{ font-size: 30px; font-weight: 900; cursor: pointer; }}
             .memo-body {{ white-space: pre-wrap; line-height: 1.8; font-weight: 800; color:#555; font-size: 17px; margin: 26px 0; }}
             .timeline-wrap {{ overflow-x: auto; }}
-            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 132px; background: white; }}
+            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 86px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
-            .bar {{ position: absolute; height: 24px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 24px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
+            .bar {{ position: absolute; height: 18px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 18px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
             .bar.pending {{ opacity: 0.45; border: 2px dashed rgba(0,0,0,0.35); }}
             .bar.gray {{ background: var(--fe-gray); color: transparent; }}
             .bar.cut {{ opacity: 0.7; text-decoration: line-through; color: #111; background: #ddd !important; border: 2px solid var(--fe-red); }}
@@ -913,6 +913,68 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 .day-publish-control .publish-state {{ font-size: 11px; min-width: 48px; }}
                 .day-publish-control .publish-btn,
                 .day-publish-control .small-btn {{ font-size: 11px; padding: 5px 6px; min-width: 62px; width: auto; }}
+            }}
+
+        
+            /* iPhone Safariで下メニューがスクロール中に浮く問題を抑える */
+            body {{
+                padding-bottom: calc(86px + env(safe-area-inset-bottom)) !important;
+                overflow-x: hidden;
+            }}
+            nav {{
+                position: fixed !important;
+                left: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                z-index: 999999 !important;
+                transform: none !important;
+                will-change: auto !important;
+                backface-visibility: hidden;
+                padding-bottom: env(safe-area-inset-bottom) !important;
+            }}
+            .bottom-nav {{
+                position: fixed !important;
+                left: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                z-index: 999999 !important;
+                transform: none !important;
+                will-change: auto !important;
+                backface-visibility: hidden;
+                padding-bottom: env(safe-area-inset-bottom) !important;
+            }}
+
+            /* 数字は游明朝系にする */
+            .date-num,
+            .time-label,
+            .cal-date,
+            .summary-num,
+            input[type="number"],
+            .deadline,
+            .bar,
+            .cal-shift {{
+                font-family: "Yu Mincho", "游明朝", "YuMincho", "Hiragino Mincho ProN", serif !important;
+                font-variant-numeric: tabular-nums;
+            }}
+
+        
+            @media (max-width: 640px) {{
+                main {{ padding: 8px 6px 92px 6px !important; }}
+                .day-card {{ margin-bottom: 8px !important; border-radius: 12px !important; }}
+                .day-head {{ grid-template-columns: 48px 1fr !important; }}
+                .day-label {{ padding: 4px 2px !important; }}
+                .day-label .dow {{ font-size: 17px !important; }}
+                .day-label .date-num {{ font-size: 22px !important; margin-top: 0 !important; }}
+                .day-memo-chip {{ font-size: 9px !important; line-height: 1.05 !important; margin-top: 3px !important; }}
+                .timeline {{ min-height: 78px !important; }}
+                .time-label {{ font-size: 10px !important; top: 3px !important; }}
+                .bar {{ height: 18px !important; line-height: 18px !important; font-size: 11px !important; border-radius: 6px !important; padding: 0 5px !important; }}
+                .bar.pending {{ border-width: 1px !important; }}
+                .bar.help-slot {{ border-width: 1px !important; }}
+                .day-publish-control {{ padding: 4px 5px !important; gap: 4px !important; }}
+                .day-publish-control .publish-state {{ font-size: 10px !important; min-width: 44px !important; }}
+                .day-publish-control .publish-btn,
+                .day-publish-control .small-btn {{ font-size: 10px !important; padding: 4px 5px !important; min-width: 52px !important; width: auto !important; }}
             }}
 
         </style>
@@ -1571,7 +1633,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
         html += '<div class="empty-note">シフトなし</div>'
 
     colors = ["#8ac053", "#4fa3a5", "#6b7fd7", "#9b65c9", "#d6b936", "#333333"]
-    y = 28
+    y = 18
 
     if visible:
         sorted_shifts = sorted(
@@ -1608,7 +1670,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                 q = f"?year={year}&month={month}" if year and month else ""
                 html += f"""
                 <a class="bar{bar_state_class}{employee_class}" href="javascript:void(0)" onclick="toggleAction('{panel_id}')" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</a>
-                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 32}px;">
+                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 22}px;">
                     <b>{escape(r['name'])}</b><br>
                     {escape(r['start'] or '--:--')} - {escape(r['end'] or '--:--')}<br>
                     <a class="btn confirm" href="/confirm-shift/{r['id']}{q}">確定</a>
@@ -1618,10 +1680,10 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                 """
             else:
                 html += f'<div class="bar{bar_state_class}{employee_class}" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</div>'
-            y += 26
+            y += 20
 
         # ヘルプ応募中バーを表示
-        app_y = max(y + 6, 88)
+        app_y = max(y + 4, 58)
         for app in help_apps:
             st = parse_time_to_hour(app["start"])
             en = parse_time_to_hour(app["end"])
@@ -1639,10 +1701,10 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                     html += f'<a class="bar help-app" href="/cancel-help/{app["id"]}" style="left:{left}px; top:{app_y}px; width:{width}px;">応募中 取消</a>'
                 else:
                     html += f'<div class="bar help-app" style="left:{left}px; top:{app_y}px; width:{width}px;">応募あり</div>'
-            app_y += 26
+            app_y += 20
 
         # 不足人数ぶん、赤いヘルプバーを複数本表示
-        help_y = max(app_y + 6, 96)
+        help_y = max(app_y + 4, 66)
         for hs, he, deficit in help_segments(shifts):
             left = (hs - START_HOUR) * PX_PER_HOUR
             width = max((he - hs) * PX_PER_HOUR, 70)
@@ -1654,9 +1716,9 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                     start_s = fmt_hour(hs)
                     end_s = fmt_hour(he)
                     html += f'<a class="bar help-slot" href="/help-apply?year={year}&month={month}&date={day}&start={start_s}&end={end_s}&slot={n+1}" style="left:{left}px; top:{help_y}px; width:{width}px;">{label}</a>'
-                help_y += 26
-        if help_y > 132:
-            html += f'<style>#day-{day} .timeline {{ min-height: {help_y + 30}px; }}</style>'
+                help_y += 20
+        if help_y > 86:
+            html += f'<style>#day-{day} .timeline {{ min-height: {help_y + 22}px; }}</style>'
 
     html += "</div></div></div></div></div>"
     return html
