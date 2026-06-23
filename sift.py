@@ -256,6 +256,19 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS shift_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        period_mode TEXT DEFAULT 'half_month',
+        deadline_day INTEGER DEFAULT 5
+    )
+    """)
+    cur.execute("""
+    INSERT OR IGNORE INTO shift_settings (id, period_mode, deadline_day)
+    VALUES (1, 'half_month', 5)
+    """)
+
+
+    cur.execute("""
     INSERT OR IGNORE INTO users (login_id, password, name, is_admin)
     VALUES (?, ?, ?, 1)
     """, (ADMIN_ID, ADMIN_PASSWORD, "管理者"))
@@ -409,6 +422,33 @@ def countdown_text(deadline_dt, now_dt=None):
     return f'<span class="countdown-danger">期限を{days}日過ぎています！</span>'
 
 
+def get_shift_settings():
+    """管理者が設定したシフト提出ルールを取得する。
+    period_mode:
+      - half_month: 1〜15日 / 16〜月末 の2週間区切り
+      - monthly: 1ヶ月ごと
+    deadline_day:
+      - half_monthでは前半提出締切日として使う。後半締切日は deadline_day + 15。
+      - monthlyでは毎月の締切日として使う。
+    """
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT period_mode, deadline_day FROM shift_settings WHERE id = 1")
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            mode = row["period_mode"] or "half_month"
+            if mode not in ("half_month", "monthly"):
+                mode = "half_month"
+            day = int(row["deadline_day"] or 5)
+            day = max(1, min(day, 28))
+            return mode, day
+    except Exception:
+        pass
+    return "half_month", 5
+
+
 def get_shift_period(today=None):
     now_dt = datetime.now()
     if today is None:
@@ -416,30 +456,61 @@ def get_shift_period(today=None):
     else:
         now_dt = datetime.combine(today, datetime.min.time())
 
-    # 期限は毎月5日と20日。期限後3日間は同じ提出期間を表示し、4日目から次の2週間へ切り替える。
-    if today.day <= 8:
-        # 当月16日〜末日分を当月5日までに提出
-        target_year = today.year
-        target_month = today.month
-        start_day = 16
-        end_day = monthrange(target_year, target_month)[1]
-        deadline = date(today.year, today.month, 5)
-    elif today.day <= 23:
-        # 翌月1日〜15日分を当月20日までに提出
-        target_year, target_month = add_month(today.year, today.month, 1)
+    mode, deadline_day = get_shift_settings()
+
+    if mode == "monthly":
+        # 1ヶ月ごと提出：
+        # 締切日までは「翌月1日〜月末」を提出。
+        # 締切日を過ぎたら自動で「翌々月1日〜月末」に切り替える。
+        current_last = monthrange(today.year, today.month)[1]
+        safe_deadline_day = min(deadline_day, current_last)
+        deadline = date(today.year, today.month, safe_deadline_day)
+
+        if today <= deadline:
+            target_year, target_month = add_month(today.year, today.month, 1)
+        else:
+            target_year, target_month = add_month(today.year, today.month, 2)
+            target_deadline_year, target_deadline_month = add_month(today.year, today.month, 1)
+            target_last = monthrange(target_deadline_year, target_deadline_month)[1]
+            deadline = date(target_deadline_year, target_deadline_month, min(deadline_day, target_last))
+
         start_day = 1
-        end_day = 15
-        deadline = date(today.year, today.month, 20)
-    else:
-        # 翌月16日〜末日分を翌月5日までに提出
-        target_year, target_month = add_month(today.year, today.month, 1)
-        start_day = 16
         end_day = monthrange(target_year, target_month)[1]
-        deadline = date(target_year, target_month, 5)
+
+    else:
+        # 2週間ごと提出：
+        # deadline_day まで → 当月16日〜月末
+        # deadline_day+15 まで → 翌月1日〜15日
+        # それ以降 → 翌月16日〜月末
+        # 期限を過ぎたら猶予なしで次の提出期間に自動切替する。
+        first_deadline_day = min(max(1, deadline_day), 15)
+        second_deadline_day = min(first_deadline_day + 15, monthrange(today.year, today.month)[1])
+        first_deadline = date(today.year, today.month, first_deadline_day)
+        second_deadline = date(today.year, today.month, second_deadline_day)
+
+        if today <= first_deadline:
+            target_year = today.year
+            target_month = today.month
+            start_day = 16
+            end_day = monthrange(target_year, target_month)[1]
+            deadline = first_deadline
+        elif today <= second_deadline:
+            target_year, target_month = add_month(today.year, today.month, 1)
+            start_day = 1
+            end_day = 15
+            deadline = second_deadline
+        else:
+            target_year, target_month = add_month(today.year, today.month, 1)
+            start_day = 16
+            end_day = monthrange(target_year, target_month)[1]
+            next_year, next_month = add_month(today.year, today.month, 1)
+            next_last = monthrange(next_year, next_month)[1]
+            deadline = date(next_year, next_month, min(first_deadline_day, next_last))
 
     deadline_dt = datetime.combine(deadline, datetime.max.time()).replace(hour=23, minute=59, second=59, microsecond=0)
     remaining_text = countdown_text(deadline_dt, now_dt)
     return target_year, target_month, start_day, end_day, deadline, remaining_text
+
 
 
 def is_published(date_value):
@@ -565,12 +636,12 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 border: 2px solid rgba(17,17,17,0.16);
                 border-radius: 999px;
                 padding: 7px 10px;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 900;
                 white-space: nowrap;
                 flex: 0 0 auto;
             }}
-            .userbar {{ background: white; padding: 10px 16px; font-size: 11px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
+            .userbar {{ background: white; padding: 10px 16px; font-size: 14px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
             .userbar a {{ color: var(--fe-green-dark); font-weight: bold; }}
             .container {{ padding: 18px; max-width: 980px; margin: auto; }}
             .logo-title {{ text-align: center; font-size: 34px; font-weight: 900; margin: 30px 0 20px; }}
@@ -584,7 +655,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .back {{ background: #666; color: white; }}
             .danger {{ background: var(--fe-red); color: white; }}
             .confirm {{ background: var(--fe-green-dark); color: white; }}
-            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 11px; border-radius: 10px; }}
+            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 14px; border-radius: 10px; }}
             .pub-on {{ background: var(--fe-green-dark) !important; color: white !important; border: 2px solid var(--fe-green-dark); }}
             .pub-off {{ background: #f2f2f2 !important; color: #555 !important; border: 2px solid #bbb; }}
             .state-on {{ color: var(--fe-green-dark); font-weight: 900; }}
@@ -602,11 +673,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             table {{ width: 100%; border-collapse: collapse; background: white; }}
             th, td {{ border: 1px solid #ddd; padding: 10px; text-align: center; }} th {{ background: #f1f6e0; }}
             .month-form {{ display: grid; grid-template-columns: 1fr 1fr 100px; gap: 8px; align-items: end; }}
-            .day-card {{ background: white; border-radius: 18px; margin-bottom: 20px; box-shadow: 0 3px 12px rgba(0,0,0,0.12); overflow: hidden; border: 2px solid var(--fe-line); }}
+            .day-card {{ background: white; border-radius: 16px; margin-bottom: 12px; box-shadow: 0 3px 12px rgba(0,0,0,0.12); overflow: hidden; border: 2px solid var(--fe-line); }}
             .day-card.today {{ border: 4px solid var(--fe-green-dark) !important; box-shadow: 0 0 0 3px rgba(166,206,57,0.28), 0 3px 12px rgba(0,0,0,0.12); }}
-            .day-head {{ display: grid; grid-template-columns: 90px 1fr; border-bottom: 1px solid #ddd; }}
-            .day-label {{ background: #f5f5f5; text-align: center; padding: 12px 6px; font-size: 22px; font-weight: 900; border-right: 1px solid #ddd; }}
-            .day-label .dow {{ font-size: 26px; }} .day-label .date-num {{ font-size: 28px; margin-top: 8px; }}
+            .day-head {{ display: grid; grid-template-columns: 74px 1fr; border-bottom: 1px solid #ddd; }}
+            .day-label {{ background: #f5f5f5; text-align: center; padding: 8px 4px; font-size: 18px; font-weight: 900; border-right: 1px solid #ddd; }}
+            .day-label .dow {{ font-size: 22px; }} .day-label .date-num {{ font-size: 24px; margin-top: 4px; }}
             .day-memo-chip {{
                 margin-top: 8px;
                 font-size: 13px;
@@ -632,8 +703,8 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 padding: 8px 10px;
                 box-shadow: none;
             }}
-            .day-publish-control .publish-state {{ font-size: 11px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
-            .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 11px; padding: 6px 8px; margin: 0; }}
+            .day-publish-control .publish-state {{ font-size: 12px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
+            .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 12px; padding: 6px 8px; margin: 0; }}
             .memo-modal {{
                 display: none;
                 position: fixed;
@@ -656,10 +727,10 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .memo-close-x {{ font-size: 30px; font-weight: 900; cursor: pointer; }}
             .memo-body {{ white-space: pre-wrap; line-height: 1.8; font-weight: 800; color:#555; font-size: 17px; margin: 26px 0; }}
             .timeline-wrap {{ overflow-x: auto; }}
-            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 190px; background: white; }}
+            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 132px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
-            .bar {{ position: absolute; height: 22px; border-radius: 5px; color: white; font-size: 11px; font-weight: bold; padding: 0 5px; line-height: 20px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
+            .bar {{ position: absolute; height: 24px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 24px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
             .bar.pending {{ opacity: 0.45; border: 2px dashed rgba(0,0,0,0.35); }}
             .bar.gray {{ background: var(--fe-gray); color: transparent; }}
             .bar.cut {{ opacity: 0.7; text-decoration: line-through; color: #111; background: #ddd !important; border: 2px solid var(--fe-red); }}
@@ -669,7 +740,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .help-note {{ background:#fff2d6; border-left:6px solid #f5a623; padding:10px; border-radius:12px; margin-bottom:12px; font-weight:bold; }}
             .action-panel {{ display: none; position: absolute; z-index: 9; background: white; border: 2px solid var(--fe-green-dark); border-radius: 12px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.2); min-width: 150px; }}
             .action-panel.show {{ display: block; }}
-            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 5px; }}
+            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 8px; }}
             .lock-mark {{ color: var(--fe-red); font-size: 26px; margin-top: 8px; }}
             .empty-note {{ position: absolute; left: 12px; top: 60px; color: #999; font-weight: bold; }}
             .summary {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
@@ -682,7 +753,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .cal-day {{ min-height: 74px; background: white; border: 1px solid var(--fe-line); border-radius: 10px; padding: 6px; font-size: 13px; }}
             .cal-day.today {{ border: 3px solid var(--fe-green-dark); }}
             .cal-date {{ font-weight: 900; margin-bottom: 4px; }}
-            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 5px; padding: 3px; font-size: 11px; font-weight: 800; }}
+            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 8px; padding: 3px; font-size: 12px; font-weight: 800; }}
             .employee-row {{ display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }}
             .footer-nav {{ position: fixed; left: 0; right: 0; bottom: 0; background: white; border-top: 1px solid #ddd; display: grid; grid-template-columns: repeat(5, 1fr); z-index: 20; }}
             .footer-nav a {{ text-align: center; padding: 10px 4px; color: #111; text-decoration: none; font-weight: bold; font-size: 13px; }}
@@ -730,11 +801,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             @media screen and (max-width: 650px) {{
                 .container {{ padding: 14px; }}
                 .shift-row {{ grid-template-columns: 30px 85px 1fr 1fr 92px; gap: 6px; }}
-                input, select {{ font-size: 11px; padding: 10px 6px; }}
-                .date-link {{ font-size: 11px; }}
+                input, select {{ font-size: 14px; padding: 10px 6px; }}
+                .date-link {{ font-size: 14px; }}
                 .month-form {{ grid-template-columns: 1fr 1fr; }} .month-form button {{ grid-column: 1 / -1; }}
                 .day-head {{ grid-template-columns: 80px 1fr; }}
-                .calendar {{ gap: 3px; }} .cal-day {{ min-height: 64px; padding: 4px; font-size: 11px; }}
+                .calendar {{ gap: 3px; }} .cal-day {{ min-height: 64px; padding: 4px; font-size: 12px; }}
                 header {{ padding: 12px 10px; }}
                 .brand-box {{ width: 36px; height: 36px; font-size: 15px; border-radius: 11px; }}
                 .header-title {{ font-size: 20px; }}
@@ -750,11 +821,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 right: 10px;
                 min-width: 26px;
                 height: 26px;
-                padding: 0 5px;
+                padding: 0 8px;
                 border-radius: 999px;
                 background: #e60012;
                 color: #fff;
-                font-size: 11px;
+                font-size: 14px;
                 line-height: 26px;
                 font-weight: 1000;
                 box-shadow: 0 2px 8px rgba(0,0,0,.22);
@@ -775,11 +846,11 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 right: 10px;
                 min-width: 26px;
                 height: 26px;
-                padding: 0 5px;
+                padding: 0 8px;
                 border-radius: 999px;
                 background: #e60012;
                 color: #fff;
-                font-size: 11px;
+                font-size: 14px;
                 line-height: 26px;
                 font-weight: 1000;
                 box-shadow: 0 2px 8px rgba(0,0,0,.22);
@@ -824,6 +895,24 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 height: 32px;
                 line-height: 1 !important;
                 margin: 0 auto !important;
+            }}
+
+        
+            @media (max-width: 640px) {{
+                main {{ padding: 10px 8px; }}
+                .day-card {{ margin-bottom: 10px; border-radius: 14px; }}
+                .day-head {{ grid-template-columns: 56px 1fr; }}
+                .day-label {{ padding: 6px 3px; }}
+                .day-label .dow {{ font-size: 18px; }}
+                .day-label .date-num {{ font-size: 21px; margin-top: 2px; }}
+                .day-memo-chip {{ font-size: 10px; line-height: 1.1; }}
+                .timeline {{ min-height: 118px; }}
+                .time-label {{ font-size: 11px; top: 4px; }}
+                .bar {{ height: 22px; line-height: 22px; font-size: 12px; border-radius: 7px; padding: 0 6px; }}
+                .day-publish-control {{ padding: 5px 6px; gap: 5px; }}
+                .day-publish-control .publish-state {{ font-size: 11px; min-width: 48px; }}
+                .day-publish-control .publish-btn,
+                .day-publish-control .small-btn {{ font-size: 11px; padding: 5px 6px; min-width: 62px; width: auto; }}
             }}
 
         </style>
@@ -1145,7 +1234,7 @@ def shift(request: Request, saved: int = 0):
         <div>残り時間</div>
         <div id="shift-countdown" class="summary-num" data-deadline="{deadline_iso}">{remaining_text}</div>
     </div>
-    <div class="box"><b>提出対象</b><br>{year}年{month}月{start_day}日〜{end_day}日</div>
+    <div class="box"><b>提出対象</b><br>{year}年{month}月{start_day}日〜{end_day}日<br><small>※締切後は自動で次の提出期間に切り替わります。</small></div>
     <form action="/shift-submit" method="post" onsubmit="return preventDoubleSubmit(this);">
         <label>名前</label><input value="{escape(user['name'])}" readonly style="background:#f0f0f0; color:#555;">
         <br><br>{rows}
@@ -1482,7 +1571,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
         html += '<div class="empty-note">シフトなし</div>'
 
     colors = ["#8ac053", "#4fa3a5", "#6b7fd7", "#9b65c9", "#d6b936", "#333333"]
-    y = 30
+    y = 28
 
     if visible:
         sorted_shifts = sorted(
@@ -1519,7 +1608,7 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                 q = f"?year={year}&month={month}" if year and month else ""
                 html += f"""
                 <a class="bar{bar_state_class}{employee_class}" href="javascript:void(0)" onclick="toggleAction('{panel_id}')" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</a>
-                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 26}px;">
+                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 32}px;">
                     <b>{escape(r['name'])}</b><br>
                     {escape(r['start'] or '--:--')} - {escape(r['end'] or '--:--')}<br>
                     <a class="btn confirm" href="/confirm-shift/{r['id']}{q}">確定</a>
@@ -1529,10 +1618,10 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                 """
             else:
                 html += f'<div class="bar{bar_state_class}{employee_class}" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</div>'
-            y += 24
+            y += 26
 
         # ヘルプ応募中バーを表示
-        app_y = max(y + 6, 118)
+        app_y = max(y + 6, 88)
         for app in help_apps:
             st = parse_time_to_hour(app["start"])
             en = parse_time_to_hour(app["end"])
@@ -1550,10 +1639,10 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                     html += f'<a class="bar help-app" href="/cancel-help/{app["id"]}" style="left:{left}px; top:{app_y}px; width:{width}px;">応募中 取消</a>'
                 else:
                     html += f'<div class="bar help-app" style="left:{left}px; top:{app_y}px; width:{width}px;">応募あり</div>'
-            app_y += 24
+            app_y += 26
 
         # 不足人数ぶん、赤いヘルプバーを複数本表示
-        help_y = max(app_y + 6, 118)
+        help_y = max(app_y + 6, 96)
         for hs, he, deficit in help_segments(shifts):
             left = (hs - START_HOUR) * PX_PER_HOUR
             width = max((he - hs) * PX_PER_HOUR, 70)
@@ -1565,9 +1654,9 @@ def timeline_html(day, shifts, published, admin=False, manage=False, year=None, 
                     start_s = fmt_hour(hs)
                     end_s = fmt_hour(he)
                     html += f'<a class="bar help-slot" href="/help-apply?year={year}&month={month}&date={day}&start={start_s}&end={end_s}&slot={n+1}" style="left:{left}px; top:{help_y}px; width:{width}px;">{label}</a>'
-                help_y += 24
-        if help_y > 165:
-            html += f'<style>.day-card[data-today="{today_flag}"] .timeline {{ min-height: {help_y + 28}px; }}</style>'
+                help_y += 26
+        if help_y > 132:
+            html += f'<style>#day-{day} .timeline {{ min-height: {help_y + 30}px; }}</style>'
 
     html += "</div></div></div></div></div>"
     return html
@@ -1859,6 +1948,7 @@ def admin(request: Request):
         <div class="card" onclick="location.href='/admin-submission-status'">シフト提出状況</div>
         <div class="card" onclick="location.href='/admin-shift-table'">シフト表確認</div>
         <div class="card" onclick="location.href='/admin-publish'">日付別公開設定</div>
+        <div class="card" onclick="location.href='/admin-shift-settings'">提出ルール設定</div>
         <div class="card" onclick="location.href='/admin-users'">従業員一覧</div>
         <div class="card badge-card" onclick="location.href='/admin-help'">ヘルプ応募確認 {help_badge}</div>
         <div class="card" onclick="location.href='/admin-labor'">人件費計算</div>
@@ -1869,6 +1959,78 @@ def admin(request: Request):
     </div>
     """
     return layout("管理画面", body, user=user)
+
+
+
+@app.get("/admin-shift-settings", response_class=HTMLResponse)
+def admin_shift_settings(request: Request):
+    user = require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    mode, deadline_day = get_shift_settings()
+    mode_label = "2週間ごと" if mode == "half_month" else "1ヶ月ごと"
+
+    body = f"""
+    <h2>提出ルール設定</h2>
+    <div class="box">
+        現在の設定：<b>{mode_label}</b> / 提出締切日：<b>{deadline_day}日</b><br>
+        2週間ごとの場合は、<b>{deadline_day}日</b> と <b>{min(deadline_day + 15, 28)}日頃</b> が締切になります。<br>
+        締切日を過ぎると、従業員のシフト提出画面は自動で次の提出期間に切り替わります。
+    </div>
+
+    <form action="/admin-shift-settings" method="post" onsubmit="return confirm('提出ルールを保存しますか？');">
+        <label>提出サイクル</label>
+        <select name="period_mode">
+            <option value="half_month" {"selected" if mode == "half_month" else ""}>2週間ごと（1〜15日 / 16〜月末）</option>
+            <option value="monthly" {"selected" if mode == "monthly" else ""}>1ヶ月ごと</option>
+        </select>
+
+        <label>提出締切日</label>
+        <input type="number" name="deadline_day" value="{deadline_day}" min="1" max="28" required>
+
+        <div class="box">
+            <b>例</b><br>
+            ・2週間ごとで締切日を5日にすると、5日締切と20日締切になります。<br>
+            ・1ヶ月ごとで締切日を20日にすると、毎月20日までに翌月分を提出します。
+        </div>
+
+        <button type="submit">保存する</button>
+    </form>
+    <a class="btn back" href="/admin">戻る</a>
+    """
+    return layout("提出ルール設定", body, user=user, auto_scroll=False)
+
+
+@app.post("/admin-shift-settings")
+def admin_shift_settings_save(
+    request: Request,
+    period_mode: str = Form("half_month"),
+    deadline_day: int = Form(5)
+):
+    backup_before_change("before_shift_settings_change")
+    user = require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    if period_mode not in ("half_month", "monthly"):
+        period_mode = "half_month"
+    deadline_day = max(1, min(int(deadline_day or 5), 28))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO shift_settings (id, period_mode, deadline_day)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        period_mode = excluded.period_mode,
+        deadline_day = excluded.deadline_day
+    """, (period_mode, deadline_day))
+    conn.commit()
+    conn.close()
+
+    return HTMLResponse("<script>alert('提出ルールを保存しました。');location='/admin-shift-settings';</script>")
+
 
 
 @app.get("/admin-submission-status", response_class=HTMLResponse)
@@ -3272,7 +3434,7 @@ def admin_export_excel(request: Request, year: int = None, month: int = None):
         ・朝/夜などの人員不足メモ<br>
         ・日付メモ<br>
         ・集計シート（従業員別の合計時間）<br>
-        
+        ・セルサイズはそのまま、文字は見やすく大きめ
     </div>
 
     <a class="btn back" href="/admin">戻る</a>
