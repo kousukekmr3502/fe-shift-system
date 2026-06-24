@@ -727,7 +727,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .memo-close-x {{ font-size: 30px; font-weight: 900; cursor: pointer; }}
             .memo-body {{ white-space: pre-wrap; line-height: 1.8; font-weight: 800; color:#555; font-size: 17px; margin: 26px 0; }}
             .timeline-wrap {{ overflow-x: auto; }}
-            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 120px; background: white; }}
+            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 180px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
             .bar {{ position: absolute; height: 24px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 24px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
@@ -979,7 +979,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
 
         
             @media (max-width: 640px) {{
-                .timeline {{ min-height: 120px !important; }}
+                .timeline {{ min-height: 180px !important; }}
                 .bar {{ height: 24px !important; line-height: 24px !important; font-size: 12px !important; border-radius: 7px !important; padding: 0 6px !important; }}
                 .time-label {{ font-size: 11px !important; top: 4px !important; }}
                 .day-card {{ margin-bottom: 10px !important; }}
