@@ -666,7 +666,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .date-link {{ font-size: 16px; font-weight: 900; text-decoration: none; color: #111; cursor: pointer; }}
             .date-link.submitted-date {{ text-decoration: underline; }}
             .saturday {{ color: #3977d8; }} .sunday {{ color: #e05252; }}
-            input[type="checkbox"] {{ width: 24px; height: 24px; }}
+            input[type="checkbox"] {{ width: 24px; height: 20px; }}
             .delete-panel {{ display: none; grid-column: 1 / -1; padding: 8px 0 2px 140px; }}
             .delete-panel.show {{ display: block; }}
             .message {{ background: #e9f6c8; border-left: 6px solid var(--fe-green-dark); padding: 12px; border-radius: 12px; font-weight: bold; margin-bottom: 16px; }}
@@ -730,7 +730,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 180px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
-            .bar {{ position: absolute; height: 24px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 24px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
+            .bar {{ position: absolute; height: 20px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 20px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
             .bar.pending {{ opacity: 0.45; border: 2px dashed rgba(0,0,0,0.35); }}
             .bar.gray {{ background: var(--fe-gray); color: transparent; }}
             .bar.cut {{ opacity: 0.7; text-decoration: line-through; color: #111; background: #ddd !important; border: 2px solid var(--fe-red); }}
@@ -980,7 +980,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
         
             @media (max-width: 640px) {{
                 .timeline {{ min-height: 180px !important; }}
-                .bar {{ height: 24px !important; line-height: 24px !important; font-size: 12px !important; border-radius: 7px !important; padding: 0 6px !important; }}
+                .bar {{ height: 20px !important; line-height: 20px !important; font-size: 11px !important; border-radius: 7px !important; padding: 0 6px !important; }}
                 .time-label {{ font-size: 11px !important; top: 4px !important; }}
                 .day-card {{ margin-bottom: 10px !important; }}
                 .day-head {{ grid-template-columns: 56px 1fr !important; }}
@@ -988,7 +988,23 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
                 .day-label .date-num {{ font-size: 24px !important; margin-top: 1px !important; }}
             }}
 
-        </style>
+        
+            .date-num,
+            .time-label,
+            .summary-num,
+            .bar,
+            input[type="number"]{
+                font-family:
+                "DIN Alternate",
+                "Avenir Next",
+                "SF Pro Display",
+                "Helvetica Neue",
+                sans-serif !important;
+                font-weight:700 !important;
+                letter-spacing:0.02em;
+            }
+
+</style>
     </head>
     <body>
         <header>
