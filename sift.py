@@ -726,7 +726,7 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             .memo-title-row {{ display:flex; justify-content:space-between; align-items:center; gap:16px; }}
             .memo-close-x {{ font-size: 30px; font-weight: 900; cursor: pointer; }}
             .memo-body {{ white-space: pre-wrap; line-height: 1.8; font-weight: 800; color:#555; font-size: 17px; margin: 26px 0; }}
-            .timeline-wrap {{ overflow-x: auto; overflow-y: hidden !important; touch-action: pan-x; }}
+            .timeline-wrap {{ overflow-x: auto; overflow-y: hidden !important; touch-action: auto; -webkit-overflow-scrolling: touch; }}
             .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 180px; background: white; }}
             .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
             .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
@@ -1008,13 +1008,25 @@ def layout(title, body, user=None, show_nav=True, auto_scroll=True):
             @media (max-width: 640px) {{
                 .timeline-wrap {{
                     overflow-y: hidden !important;
-                    touch-action: pan-x !important;
+                    touch-action: auto !important;
                 }}
                 .bar {{
                     height: 21px !important;
                     line-height: 21px !important;
                     font-size: 11px !important;
                 }}
+            }}
+
+        
+            /* タイムボード内は縦スクロールさせず、画面全体の縦スクロールは許可する */
+            .timeline-wrap {{
+                overflow-x: auto !important;
+                overflow-y: hidden !important;
+                touch-action: auto !important;
+                -webkit-overflow-scrolling: touch;
+            }}
+            .timeline {{
+                overflow-y: hidden !important;
             }}
 
         </style>
