@@ -3,5 +3,13 @@
   "name": "fe-shift-system",
   "main": "src/main.py",
   "compatibility_date": "2026-10-07",
-  "compatibility_flags": ["python_workers"]
+  "compatibility_flags": ["python_workers"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fe-shift-system-db",
+      "database_id": "11c26464-5957-484d-9075-abca4d883eda"
+    }
+  ]
 }
