@@ -1,113 +1,3875 @@
-"""FE Portal D1 migration, stage 1: secure login and employee portal shell.
-Requires D1 binding DB and Worker secret SESSION_SECRET.
-Do not use as a full replacement for original sift.py functionality yet.
-"""
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from workers import WorkerEntrypoint
-import asgi
-import hmac
-import hashlib
-import base64
-import time
+from fastapi import FastAPI, Form, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
+from datetime import date, datetime, timedelta, timezone
+from calendar import monthrange
 from html import escape
+import json
+from io import BytesIO
 
-app = FastAPI()
-DB = None
-SESSION_SECRET = None
-COOKIE = 'fe_session'
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+START_HOUR = 9
+END_HOUR = 22
+PX_PER_HOUR = 80
 
-
-def page(title, body):
-    return HTMLResponse('<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+escape(title)+'</title><style>body{font-family:system-ui,sans-serif;max-width:540px;margin:48px auto;padding:0 20px;color:#222}input,button{box-sizing:border-box;width:100%;padding:13px;margin:8px 0;font-size:16px}button{background:#1565c0;color:white;border:0;border-radius:7px}a{color:#1565c0}.card{padding:22px;border:1px solid #ddd;border-radius:12px}</style><h1>FE Portal</h1>'+body+'</html>')
-
-
-def sign(data):
-    return hmac.new(SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()
+def redirect(path):
+    return RedirectResponse(path, status_code=303)
 
 
-def make_token(uid):
-    data = str(uid) + ':' + str(int(time.time()) + 12 * 3600)
-    raw = data + ':' + sign(data)
-    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip('=')
 
 
-def parse_token(token):
-    if not SESSION_SECRET or not token:
-        return None
+async def require_login(request: Request):
+    return await current_user(request)
+
+
+def is_admin_user(user):
+    return user is not None and int(user["is_admin"] or 0) == 1
+
+
+def time_options(selected=""):
+    html = '<option value="">--:--</option>'
+    for h in range(START_HOUR, END_HOUR + 1):
+        for m in ("00", "30"):
+            if h == END_HOUR and m == "30":
+                continue
+            t = f"{h:02d}:{m}"
+            sel = "selected" if selected == t else ""
+            html += f'<option value="{t}" {sel}>{t}</option>'
+    return html
+
+
+def limit_options(selected="指定しない"):
+    values = ["指定しない", "3時間以内", "4時間以内", "5時間以内", "6時間以内", "7時間以内", "8時間以内", "9時間以内", "休み希望"]
+    html = ""
+    for v in values:
+        sel = "selected" if selected == v else ""
+        html += f'<option value="{v}" {sel}>{v}</option>'
+    return html
+
+
+def parse_time_to_hour(t):
     try:
-        raw = base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode()
-        uid, expiry, signature = raw.rsplit(':', 2)
-        data = uid + ':' + expiry
-        if int(expiry) < int(time.time()) or not hmac.compare_digest(signature, sign(data)):
-            return None
-        return uid
-    except (ValueError, TypeError, UnicodeError):
+        h, m = t.split(":")
+        return int(h) + int(m) / 60
+    except Exception:
         return None
+
+
+def calc_hours(start, end):
+    s = parse_time_to_hour(start)
+    e = parse_time_to_hour(end)
+    if s is None or e is None or e <= s:
+        return 0
+    return e - s
+
+
+def add_month(year, month, n=1):
+    month += n
+    while month > 12:
+        month -= 12
+        year += 1
+    while month < 1:
+        month += 12
+        year -= 1
+    return year, month
+
+
+def countdown_text(deadline_dt, now_dt=None):
+    if now_dt is None:
+        now_dt = jst_now()
+
+    diff_seconds = int((deadline_dt - now_dt).total_seconds())
+
+    if diff_seconds >= 0:
+        if diff_seconds <= 24 * 3600:
+            hours = max(1, (diff_seconds + 3599) // 3600)
+            return f'<span class="countdown-danger">残り{hours}時間！</span>'
+        days = (diff_seconds + 86399) // 86400
+        return f"残り{days}日"
+
+    passed = abs(diff_seconds)
+    if passed <= 24 * 3600:
+        hours = max(1, (passed + 3599) // 3600)
+        return f'<span class="countdown-danger">期限を{hours}時間過ぎています！</span>'
+    days = (passed + 86399) // 86400
+    return f'<span class="countdown-danger">期限を{days}日過ぎています！</span>'
+
+
+async def get_shift_settings():
+    """管理者が設定したシフト提出ルールを取得する。
+    period_mode:
+      - half_month: 1〜15日 / 16〜月末 の2週間区切り
+      - monthly: 1ヶ月ごと
+    deadline_day:
+      - half_monthでは前半提出締切日として使う。後半締切日は deadline_day + 15。
+      - monthlyでは毎月の締切日として使う。
+    """
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        await cur.execute("SELECT period_mode, deadline_day FROM shift_settings WHERE id = 1")
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            mode = row["period_mode"] or "half_month"
+            if mode not in ("half_month", "monthly"):
+                mode = "half_month"
+            day = int(row["deadline_day"] or 5)
+            day = max(1, min(day, 28))
+            return mode, day
+    except Exception:
+        pass
+    return "half_month", 5
+
+
+async def get_shift_period(today=None):
+    now_dt = jst_now()
+    if today is None:
+        today = now_dt.date()
+    else:
+        now_dt = datetime.combine(today, datetime.min.time())
+
+    mode, deadline_day = await get_shift_settings()
+
+    if mode == "monthly":
+        # 1ヶ月ごと提出：
+        # 締切日までは「翌月1日〜月末」を提出。
+        # 締切日を過ぎたら自動で「翌々月1日〜月末」に切り替える。
+        current_last = monthrange(today.year, today.month)[1]
+        safe_deadline_day = min(deadline_day, current_last)
+        deadline = date(today.year, today.month, safe_deadline_day)
+
+        if today <= deadline:
+            target_year, target_month = add_month(today.year, today.month, 1)
+        else:
+            target_year, target_month = add_month(today.year, today.month, 2)
+            target_deadline_year, target_deadline_month = add_month(today.year, today.month, 1)
+            target_last = monthrange(target_deadline_year, target_deadline_month)[1]
+            deadline = date(target_deadline_year, target_deadline_month, min(deadline_day, target_last))
+
+        start_day = 1
+        end_day = monthrange(target_year, target_month)[1]
+
+    else:
+        # 2週間ごと提出：
+        # deadline_day まで → 当月16日〜月末
+        # deadline_day+15 まで → 翌月1日〜15日
+        # それ以降 → 翌月16日〜月末
+        # 期限を過ぎたら猶予なしで次の提出期間に自動切替する。
+        first_deadline_day = min(max(1, deadline_day), 15)
+        second_deadline_day = min(first_deadline_day + 15, monthrange(today.year, today.month)[1])
+        first_deadline = date(today.year, today.month, first_deadline_day)
+        second_deadline = date(today.year, today.month, second_deadline_day)
+
+        if today <= first_deadline:
+            target_year = today.year
+            target_month = today.month
+            start_day = 16
+            end_day = monthrange(target_year, target_month)[1]
+            deadline = first_deadline
+        elif today <= second_deadline:
+            target_year, target_month = add_month(today.year, today.month, 1)
+            start_day = 1
+            end_day = 15
+            deadline = second_deadline
+        else:
+            target_year, target_month = add_month(today.year, today.month, 1)
+            start_day = 16
+            end_day = monthrange(target_year, target_month)[1]
+            next_year, next_month = add_month(today.year, today.month, 1)
+            next_last = monthrange(next_year, next_month)[1]
+            deadline = date(next_year, next_month, min(first_deadline_day, next_last))
+
+    deadline_dt = datetime.combine(deadline, datetime.max.time()).replace(hour=23, minute=59, second=59, microsecond=0)
+    remaining_text = countdown_text(deadline_dt, now_dt)
+    return target_year, target_month, start_day, end_day, deadline, remaining_text
+
+
+
+async def is_published(date_value):
+    rows = await query('SELECT date,published FROM published_days WHERE date BETWEEN ? AND ?', (date_value[:7]+'-01',date_value[:7]+'-31'))
+    return any(r['date']==date_value and int(r['published'] or 0)==1 for r in rows)
+
+
+async def get_day_memo(date_value):
+    rows = await query('SELECT date,memo FROM day_memos WHERE date BETWEEN ? AND ?', (date_value[:7]+'-01',date_value[:7]+'-31'))
+    return next((r['memo'] or '' for r in rows if r['date']==date_value),'')
+
+
+def short_memo(memo, n=18):
+    memo = (memo or "").strip()
+    if not memo:
+        return ""
+    first = memo.replace("\r", "").replace("\n", " ")
+    return first if len(first) <= n else first[:n] + "..."
+
+
+def layout(title, body, user=None, show_nav=True, auto_scroll=True):
+    user_part = ""
+    if user:
+        role = "管理者" if is_admin_user(user) else "スタッフ"
+        user_part = f'<div class="userbar">{escape(user["name"])} さん / {role}　<a href="/logout">ログアウト</a></div>'
+    nav = ""
+    if show_nav and user:
+        admin_link = '<a href="/admin">管理</a>' if is_admin_user(user) else '<a href="/opinion">意見箱</a>'
+        nav = f"""
+        <div class="bottom-space"></div>
+        <nav class="footer-nav">
+            <a href="/portal">ホーム</a>
+            <a href="/shift">提出</a>
+            <a href="/myshift">マイシフト</a>
+            <a href="/shift-table">シフト表</a>
+            {admin_link}
+        </nav>
+        """
+    return f"""
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="UTF-8">
+        <title>{escape(title)}</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            :root {{
+                --fe-green: #a6ce39;
+                --fe-green-dark: #6a9f00;
+                --fe-black: #111111;
+                --fe-bg: #f7faef;
+                --fe-line: #dfe9c9;
+                --fe-red: #e05252;
+                --fe-gray: #aeb5bd;
+            }}
+            * {{ box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+                margin: 0;
+                background: var(--fe-bg);
+                color: var(--fe-black);
+            }}
+            header {{
+                background: linear-gradient(135deg, #a6ce39 0%, #d7f26b 52%, #ffffff 100%);
+                color: var(--fe-black);
+                padding: 14px 18px;
+                border-bottom: 4px solid var(--fe-black);
+                box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+                position: sticky;
+                top: 0;
+                z-index: 30;
+            }}
+            .header-inner {{
+                max-width: 980px;
+                margin: 0 auto;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }}
+            .brand-box {{
+                width: 42px;
+                height: 42px;
+                border-radius: 13px;
+                background: var(--fe-black);
+                color: var(--fe-green);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: 1000;
+                font-size: 18px;
+                box-shadow: 0 3px 0 rgba(0,0,0,0.18);
+                flex: 0 0 auto;
+            }}
+            .header-title {{
+                flex: 1;
+                text-align: center;
+                font-size: 23px;
+                font-weight: 1000;
+                letter-spacing: .04em;
+                line-height: 1.15;
+            }}
+            .header-sub {{
+                display: block;
+                font-size: 11px;
+                font-weight: 800;
+                letter-spacing: .16em;
+                opacity: .72;
+                margin-top: 3px;
+            }}
+            .header-pill {{
+                background: rgba(255,255,255,0.72);
+                border: 2px solid rgba(17,17,17,0.16);
+                border-radius: 999px;
+                padding: 7px 10px;
+                font-size: 12px;
+                font-weight: 900;
+                white-space: nowrap;
+                flex: 0 0 auto;
+            }}
+            .userbar {{ background: white; padding: 10px 16px; font-size: 14px; border-bottom: 1px solid var(--fe-line); text-align: right; }}
+            .userbar a {{ color: var(--fe-green-dark); font-weight: bold; }}
+            .container {{ padding: 18px; max-width: 980px; margin: auto; }}
+            .logo-title {{ text-align: center; font-size: 34px; font-weight: 900; margin: 30px 0 20px; }}
+            .login-card, .box {{ background: white; padding: 18px; margin-bottom: 16px; border-radius: 18px; box-shadow: 0 3px 12px rgba(0,0,0,0.10); border: 1px solid var(--fe-line); }}
+            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+            .card {{ background: white; border: 2px solid var(--fe-line); border-radius: 18px; padding: 30px 10px; text-align: center; font-size: 20px; font-weight: 900; box-shadow: 0 3px 10px rgba(0,0,0,0.10); cursor: pointer; }}
+            .card:hover {{ border-color: var(--fe-green); }}
+            label {{ font-weight: bold; display: block; margin-top: 12px; }}
+            input, select, textarea {{ padding: 12px; font-size: 16px; border: 1px solid #d7d7d7; border-radius: 12px; width: 100%; background: white; }}
+            button, .btn {{ display: block; width: 100%; padding: 15px; margin-top: 14px; font-size: 18px; border: none; border-radius: 14px; background: var(--fe-green); color: var(--fe-black); font-weight: 900; text-align: center; text-decoration: none; cursor: pointer; }}
+            .back {{ background: #666; color: white; }}
+            .danger {{ background: var(--fe-red); color: white; }}
+            .confirm {{ background: var(--fe-green-dark); color: white; }}
+            .small-btn {{ display: inline-block; width: auto; padding: 8px 12px; margin: 4px 0; font-size: 14px; border-radius: 10px; }}
+            .pub-on {{ background: var(--fe-green-dark) !important; color: white !important; border: 2px solid var(--fe-green-dark); }}
+            .pub-off {{ background: #f2f2f2 !important; color: #555 !important; border: 2px solid #bbb; }}
+            .state-on {{ color: var(--fe-green-dark); font-weight: 900; }}
+            .state-off {{ color: #777; font-weight: 900; }}
+            .submitted-btn {{ background: #e4f3bd; border: 2px solid var(--fe-green-dark); color: var(--fe-black); }}
+            .shift-row {{ display: grid; grid-template-columns: 34px 105px 1fr 1fr 122px; gap: 8px; align-items: center; margin: 12px 0; }}
+            .shift-row.submitted {{ background: #f2f8df; border-radius: 12px; padding: 6px; }}
+            .date-link {{ font-size: 16px; font-weight: 900; text-decoration: none; color: #111; cursor: pointer; }}
+            .date-link.submitted-date {{ text-decoration: underline; }}
+            .saturday {{ color: #3977d8; }} .sunday {{ color: #e05252; }}
+            input[type="checkbox"] {{ width: 24px; height: 21px; }}
+            .delete-panel {{ display: none; grid-column: 1 / -1; padding: 8px 0 2px 140px; }}
+            .delete-panel.show {{ display: block; }}
+            .message {{ background: #e9f6c8; border-left: 6px solid var(--fe-green-dark); padding: 12px; border-radius: 12px; font-weight: bold; margin-bottom: 16px; }}
+            table {{ width: 100%; border-collapse: collapse; background: white; }}
+            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: center; }} th {{ background: #f1f6e0; }}
+            .month-form {{ display: grid; grid-template-columns: 1fr 1fr 100px; gap: 8px; align-items: end; }}
+            .day-card {{ background: white; border-radius: 14px; margin-bottom: 8px; box-shadow: 0 3px 12px rgba(0,0,0,0.12); overflow: hidden; border: 2px solid var(--fe-line); }}
+            .day-card.today {{ border: 4px solid var(--fe-green-dark) !important; box-shadow: 0 0 0 3px rgba(166,206,57,0.28), 0 3px 12px rgba(0,0,0,0.12); }}
+            .day-head {{ display: grid; grid-template-columns: 58px 1fr; border-bottom: 1px solid #ddd; }}
+            .day-label {{ background: #f5f5f5; text-align: center; padding: 5px 3px; font-size: 15px; font-weight: 900; border-right: 1px solid #ddd; }}
+            .day-label .dow {{ font-size: 19px; }} .day-label .date-num {{ font-size: 23px; margin-top: 1px; }}
+            .day-memo-chip {{
+                margin-top: 8px;
+                font-size: 13px;
+                line-height: 1.25;
+                color: #555;
+                font-weight: 900;
+                cursor: pointer;
+                word-break: break-all;
+            }}
+            .day-memo-chip:hover {{ color: var(--fe-green-dark); }}
+            .day-main {{
+                min-width: 0;
+            }}
+            .day-publish-control {{
+                position: static;
+                z-index: 8;
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                justify-content: flex-end;
+                background: rgba(255,255,255,0.96);
+                border-bottom: 1px solid var(--fe-line);
+                padding: 8px 10px;
+                box-shadow: none;
+            }}
+            .day-publish-control .publish-state {{ font-size: 12px; min-width: 56px; display:inline-flex; align-items:center; justify-content:center; line-height:1; }}
+            .day-publish-control .publish-btn {{ width: 78px; min-width: 78px; font-size: 12px; padding: 6px 8px; margin: 0; }}
+            .memo-modal {{
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.45);
+                z-index: 999;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+            }}
+            .memo-modal.show {{ display: flex; }}
+            .memo-box {{
+                width: min(520px, 92vw);
+                background: white;
+                border-radius: 22px;
+                padding: 24px;
+                box-shadow: 0 12px 36px rgba(0,0,0,0.28);
+            }}
+            .memo-title-row {{ display:flex; justify-content:space-between; align-items:center; gap:16px; }}
+            .memo-close-x {{ font-size: 30px; font-weight: 900; cursor: pointer; }}
+            .memo-body {{ white-space: pre-wrap; line-height: 1.8; font-weight: 800; color:#555; font-size: 17px; margin: 26px 0; }}
+            .timeline-wrap {{ overflow-x: auto; overflow-y: hidden !important; touch-action: auto; -webkit-overflow-scrolling: touch; }}
+            .timeline {{ position: relative; min-width: {((END_HOUR - START_HOUR) * PX_PER_HOUR) + 100}px; min-height: 180px; background: white; }}
+            .time-line {{ position: absolute; top: 0; bottom: 0; width: 1px; background: #cfcfcf; }}
+            .time-label {{ position: absolute; top: 6px; font-size: 13px; color: #666; }}
+            .bar {{ position: absolute; height: 21px; border-radius: 8px; color: white; font-size: 14px; font-weight: bold; padding: 0 8px; line-height: 21px; overflow: hidden; white-space: nowrap; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.15); text-decoration: none; display: block; }}
+            .bar.pending {{ opacity: 0.45; border: 2px dashed rgba(0,0,0,0.35); }}
+            .bar.gray {{ background: var(--fe-gray); color: transparent; }}
+            .bar.cut {{ opacity: 0.7; text-decoration: line-through; color: #111; background: #ddd !important; border: 2px solid var(--fe-red); }}
+            .bar.help {{ background: #ee5b5f !important; color: white; border: 2px solid #c82333; }}
+            .bar.help-slot {{ background: #ee5b5f !important; color: white; border: 2px solid #c82333; text-align:center; }}
+            .bar.help-app {{ background: #f5a623 !important; color: white; border: 2px solid #d98200; }}
+            .help-note {{ background:#fff2d6; border-left:6px solid #f5a623; padding:10px; border-radius:12px; margin-bottom:12px; font-weight:bold; }}
+            .action-panel {{ display: none; position: absolute; z-index: 9; background: white; border: 2px solid var(--fe-green-dark); border-radius: 12px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.2); min-width: 150px; }}
+            .action-panel.show {{ display: block; }}
+            .action-panel .btn {{ margin-top: 6px; padding: 8px 10px; font-size: 13px; border-radius: 8px; }}
+            .lock-mark {{ color: var(--fe-red); font-size: 26px; margin-top: 8px; }}
+            .empty-note {{ position: absolute; left: 12px; top: 60px; color: #999; font-weight: bold; }}
+            .summary {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+            .summary .box {{ text-align: center; }} .summary-num {{ font-size: 28px; font-weight: 900; color: var(--fe-green-dark); }}
+            .countdown-danger {{ color: #d60000; font-weight: 900; }}
+            .status-ok {{ color: var(--fe-green-dark); font-weight: 900; }}
+            .status-ng {{ color: #d60000; font-weight: 900; }}
+            .calendar {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 18px; }}
+            .cal-head {{ text-align: center; font-weight: 900; padding: 8px 0; color: #666; }}
+            .cal-day {{ min-height: 74px; background: white; border: 1px solid var(--fe-line); border-radius: 10px; padding: 6px; font-size: 13px; }}
+            .cal-day.today {{ border: 3px solid var(--fe-green-dark); }}
+            .cal-date {{ font-weight: 900; margin-bottom: 4px; }}
+            .cal-shift {{ background: #e4f3bd; color: #111; border-radius: 8px; padding: 3px; font-size: 12px; font-weight: 800; }}
+            .employee-row {{ display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }}
+            .footer-nav {{ position: fixed; left: 0; right: 0; bottom: 0; background: white; border-top: 1px solid #ddd; display: grid; grid-template-columns: repeat(5, 1fr); z-index: 20; }}
+            .footer-nav a {{ text-align: center; padding: 10px 4px; color: #111; text-decoration: none; font-weight: bold; font-size: 13px; }}
+            .bottom-space {{ height: 56px; }}
+
+            .publish-table {{
+                table-layout: fixed;
+                width: 100%;
+            }}
+
+            .publish-table th:nth-child(1),
+            .publish-table td:nth-child(1) {{
+                width: 20%;
+            }}
+
+            .publish-table th:nth-child(2),
+            .publish-table td:nth-child(2) {{
+                width: 18%;
+            }}
+
+            .publish-table th:nth-child(3),
+            .publish-table td:nth-child(3) {{
+                width: 24%;
+            }}
+
+            .publish-table th:nth-child(4),
+            .publish-table td:nth-child(4) {{
+                width: 38%;
+            }}
+
+            .publish-state {{
+                display: inline-block;
+                min-width: 72px;
+                text-align: center;
+                font-weight: 900;
+            }}
+
+            .publish-btn {{
+                width: 128px;
+                min-width: 128px;
+                text-align: center;
+                white-space: nowrap;
+            }}
+
+            @media screen and (max-width: 650px) {{
+                .container {{ padding: 14px; }}
+                .shift-row {{ grid-template-columns: 30px 85px 1fr 1fr 92px; gap: 6px; }}
+                input, select {{ font-size: 14px; padding: 10px 6px; }}
+                .date-link {{ font-size: 14px; }}
+                .month-form {{ grid-template-columns: 1fr 1fr; }} .month-form button {{ grid-column: 1 / -1; }}
+                .day-head {{ grid-template-columns: 80px 1fr; }}
+                .calendar {{ gap: 3px; }} .cal-day {{ min-height: 64px; padding: 4px; font-size: 12px; }}
+                header {{ padding: 12px 10px; }}
+                .brand-box {{ width: 36px; height: 36px; font-size: 15px; border-radius: 11px; }}
+                .header-title {{ font-size: 20px; }}
+                .header-pill {{ font-size: 10px; padding: 6px 8px; }}
+            }}
+        
+            .badge-card {{
+                position: relative;
+            }}
+            .app-badge {{
+                position: absolute;
+                top: 8px;
+                right: 10px;
+                min-width: 26px;
+                height: 26px;
+                padding: 0 8px;
+                border-radius: 999px;
+                background: #e60012;
+                color: #fff;
+                font-size: 14px;
+                line-height: 26px;
+                font-weight: 1000;
+                box-shadow: 0 2px 8px rgba(0,0,0,.22);
+            }}
+            .notify-box {{
+                border: 2px solid #e60012 !important;
+                color: #e60012;
+                font-weight: 900;
+            }}
+
+        
+            .badge-card {{
+                position: relative;
+            }}
+            .app-badge {{
+                position: absolute;
+                top: 8px;
+                right: 10px;
+                min-width: 26px;
+                height: 26px;
+                padding: 0 8px;
+                border-radius: 999px;
+                background: #e60012;
+                color: #fff;
+                font-size: 14px;
+                line-height: 26px;
+                font-weight: 1000;
+                box-shadow: 0 2px 8px rgba(0,0,0,.22);
+            }}
+            .notify-box {{
+                border: 2px solid #e60012 !important;
+                color: #e60012;
+                font-weight: 900;
+            }}
+            .help-status-pending {{
+                color: #e60012;
+                font-weight: 1000;
+            }}
+            .help-status-approved {{
+                color: #6a9f00;
+                font-weight: 1000;
+            }}
+            .help-status-rejected {{
+                color: #777;
+                font-weight: 900;
+            }}
+
+        
+            .bar.employee-bar {{
+                background: #111111 !important;
+                color: #ffffff !important;
+                font-weight: 1000;
+                border: 1px solid #000;
+            }}
+
+        
+            .publish-table th,
+            .publish-table td {{
+                vertical-align: middle !important;
+                text-align: center;
+            }}
+            .publish-table .publish-state {{
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                min-width: 64px;
+                height: 32px;
+                line-height: 1 !important;
+                margin: 0 auto !important;
+            }}
+
+        
+            @media (max-width: 640px) {{
+                main {{ padding: 10px 8px; }}
+                .day-card {{ margin-bottom: 10px; border-radius: 14px; }}
+                .day-head {{ grid-template-columns: 56px 1fr; }}
+                .day-label {{ padding: 6px 3px; }}
+                .day-label .dow {{ font-size: 18px; }}
+                .day-label .date-num {{ font-size: 21px; margin-top: 2px; }}
+                .day-memo-chip {{ font-size: 10px; line-height: 1.1; }}
+                .timeline {{ min-height: 118px; }}
+                .time-label {{ font-size: 11px; top: 4px; }}
+                .bar {{ height: 22px; line-height: 22px; font-size: 12px; border-radius: 7px; padding: 0 6px; }}
+                .day-publish-control {{ padding: 5px 6px; gap: 5px; }}
+                .day-publish-control .publish-state {{ font-size: 11px; min-width: 48px; }}
+                .day-publish-control .publish-btn,
+                .day-publish-control .small-btn {{ font-size: 11px; padding: 5px 6px; min-width: 62px; width: auto; }}
+            }}
+
+        
+            /* iPhone Safariで下メニューがスクロール中に浮く問題を抑える */
+            body {{
+                padding-bottom: calc(86px + env(safe-area-inset-bottom)) !important;
+                overflow-x: hidden;
+            }}
+            nav {{
+                position: fixed !important;
+                left: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                z-index: 999999 !important;
+                transform: none !important;
+                will-change: auto !important;
+                backface-visibility: hidden;
+                padding-bottom: env(safe-area-inset-bottom) !important;
+            }}
+            .bottom-nav {{
+                position: fixed !important;
+                left: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                z-index: 999999 !important;
+                transform: none !important;
+                will-change: auto !important;
+                backface-visibility: hidden;
+                padding-bottom: env(safe-area-inset-bottom) !important;
+            }}
+
+            /* 数字は游明朝系にする */
+            .date-num,
+            .time-label,
+            .cal-date,
+            .summary-num,
+            input[type="number"],
+            .deadline,
+            .bar,
+            .cal-shift {{
+                font-family: "Yu Mincho", "游明朝", "YuMincho", "Hiragino Mincho ProN", serif !important;
+                font-variant-numeric: tabular-nums;
+            }}
+
+        
+            @media (max-width: 640px) {{
+                main {{ padding: 8px 6px 92px 6px !important; }}
+                .day-card {{ margin-bottom: 8px !important; border-radius: 12px !important; }}
+                .day-head {{ grid-template-columns: 48px 1fr !important; }}
+                .day-label {{ padding: 4px 2px !important; }}
+                .day-label .dow {{ font-size: 17px !important; }}
+                .day-label .date-num {{ font-size: 22px !important; margin-top: 0 !important; }}
+                .day-memo-chip {{ font-size: 9px !important; line-height: 1.05 !important; margin-top: 3px !important; }}
+                .timeline {{ min-height: 78px !important; }}
+                .time-label {{ font-size: 10px !important; top: 3px !important; }}
+                .bar {{ height: 18px !important; line-height: 18px !important; font-size: 11px !important; border-radius: 6px !important; padding: 0 5px !important; }}
+                .bar.pending {{ border-width: 1px !important; }}
+                .bar.help-slot {{ border-width: 1px !important; }}
+                .day-publish-control {{ padding: 4px 5px !important; gap: 4px !important; }}
+                .day-publish-control .publish-state {{ font-size: 10px !important; min-width: 44px !important; }}
+                .day-publish-control .publish-btn,
+                .day-publish-control .small-btn {{ font-size: 10px !important; padding: 4px 5px !important; min-width: 52px !important; width: auto !important; }}
+            }}
+
+        
+            @media (max-width: 640px) {{
+                .timeline {{ min-height: 180px !important; }}
+                .bar {{ height: 21px !important; line-height: 21px !important; font-size: 11px !important; border-radius: 7px !important; padding: 0 6px !important; }}
+                .time-label {{ font-size: 11px !important; top: 4px !important; }}
+                .day-card {{ margin-bottom: 10px !important; }}
+                .day-head {{ grid-template-columns: 56px 1fr !important; }}
+                .day-label .dow {{ font-size: 18px !important; }}
+                .day-label .date-num {{ font-size: 24px !important; margin-top: 1px !important; }}
+            }}
+
+        
+            /* 数字フォントを見やすいゴシック系に変更 */
+            .date-num,
+            .time-label,
+            .cal-date,
+            .summary-num,
+            input[type="number"],
+            .deadline,
+            .bar,
+            .cal-shift {{
+                font-family: "Avenir Next", "SF Pro Display", "Helvetica Neue", Arial, sans-serif !important;
+                font-weight: 800 !important;
+                font-variant-numeric: tabular-nums;
+                letter-spacing: 0.02em;
+            }}
+
+        
+            @media (max-width: 640px) {{
+                .timeline-wrap {{
+                    overflow-y: hidden !important;
+                    touch-action: auto !important;
+                }}
+                .bar {{
+                    height: 21px !important;
+                    line-height: 21px !important;
+                    font-size: 11px !important;
+                }}
+            }}
+
+        
+            /* タイムボード内は縦スクロールさせず、画面全体の縦スクロールは許可する */
+            .timeline-wrap {{
+                overflow-x: auto !important;
+                overflow-y: hidden !important;
+                touch-action: auto !important;
+                -webkit-overflow-scrolling: touch;
+            }}
+            .timeline {{
+                overflow-y: hidden !important;
+            }}
+
+        </style>
+    </head>
+    <body>
+        <header>
+            <div class="header-inner">
+                <div class="brand-box">FE</div>
+                <div class="header-title">{escape(title)}<span class="header-sub">FIT-EASY PORTAL</span></div>
+                <div class="header-pill">Portal</div>
+            </div>
+        </header>
+        {user_part}
+        <div class="container">{body}</div>
+        <div id="dayMemoModal" class="memo-modal" onclick="if(event.target.id==='dayMemoModal') closeDayMemo()">
+            <div class="memo-box">
+                <div class="memo-title-row">
+                    <h2 id="dayMemoTitle">メモ</h2>
+                    <div class="memo-close-x" onclick="closeDayMemo()">×</div>
+                </div>
+                <div id="dayMemoBody" class="memo-body"></div>
+                <button type="button" class="back" onclick="closeDayMemo()">閉じる</button>
+            </div>
+        </div>
+        {nav}
+        <script>
+            function toggleDelete(id) {{
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('show');
+            }}
+            function toggleAction(id) {{
+                document.querySelectorAll('.action-panel').forEach(function(panel) {{
+                    if (panel.id !== id) panel.classList.remove('show');
+                }});
+                const el = document.getElementById(id);
+                if (el) el.classList.toggle('show');
+            }}
+            async function setPublishAjax(day, value) {{
+                try {{
+                    const res = await fetch('/set-publish/' + day + '/' + value + '?ajax=1', {{method:'POST', headers:{{'X-CSRF-Token':document.querySelector('meta[name=csrf-token]').content}}}});
+                    if (!res.ok) throw new Error('通信エラー');
+                    const nextValue = value === 1 ? 0 : 1;
+                    const state = document.getElementById('pub-state-' + day);
+                    const btn = document.getElementById('pub-btn-' + day);
+                    if (state) {{
+                        state.textContent = value === 1 ? '公開中' : '非公開';
+                        state.className = value === 1 ? 'publish-state state-on' : 'publish-state state-off';
+                    }}
+                    if (btn) {{
+                        btn.textContent = value === 1 ? '非公開にする' : '公開する';
+                        btn.className = value === 1 ? 'btn small-btn publish-btn pub-off' : 'btn small-btn publish-btn pub-on';
+                        btn.setAttribute('onclick', "setPublishAjax('" + day + "', " + nextValue + "); return false;");
+                        btn.href = '/set-publish/' + day + '/' + nextValue;
+                    }}
+                }} catch(e) {{
+                    alert('公開設定の変更に失敗しました');
+                }}
+            }}
+            function showDayMemo(title, memo) {{
+                const modal = document.getElementById('dayMemoModal');
+                const titleEl = document.getElementById('dayMemoTitle');
+                const bodyEl = document.getElementById('dayMemoBody');
+                if (!modal || !titleEl || !bodyEl) return;
+                titleEl.textContent = title;
+                bodyEl.textContent = memo;
+                modal.classList.add('show');
+            }}
+            function closeDayMemo() {{
+                const modal = document.getElementById('dayMemoModal');
+                if (modal) modal.classList.remove('show');
+            }}
+            const AUTO_SCROLL_TO_TODAY = {str(auto_scroll).lower()};
+            window.addEventListener('load', function() {{
+                const path = window.location.pathname;
+                if (path === '/admin-shifts') {{
+                    const y = sessionStorage.getItem('adminShiftsScrollY');
+                    if (y !== null) {{
+                        window.scrollTo(0, parseInt(y || '0', 10));
+                        sessionStorage.removeItem('adminShiftsScrollY');
+                        return;
+                    }}
+                }}
+                // Renderのサーバー日付ではなく、見ている端末の今日の日付で判定する
+                const now = new Date();
+                const localToday = now.getFullYear() + '-' +
+                    String(now.getMonth() + 1).padStart(2, '0') + '-' +
+                    String(now.getDate()).padStart(2, '0');
+
+                document.querySelectorAll('.day-card.today').forEach(function(el) {{
+                    el.classList.remove('today');
+                }});
+                const localTodayCard = document.querySelector('[data-date="' + localToday + '"]');
+                if (localTodayCard) localTodayCard.classList.add('today');
+
+                if (!AUTO_SCROLL_TO_TODAY) return;
+                const target = localTodayCard || document.querySelector('[data-today="1"]');
+                if (target) target.scrollIntoView({{behavior: 'smooth', block: 'start'}});
+            }});
+
+            window.addEventListener('click', function(e) {{
+                const a = e.target.closest('a');
+                if (!a) return;
+                const href = a.getAttribute('href') || '';
+                if (window.location.pathname === '/admin-shifts' &&
+                    (href.includes('/admin-shift-action/') || href.includes('/confirm-shift/') || href.includes('/cut-shift/'))) {{
+                    sessionStorage.setItem('adminShiftsScrollY', String(window.scrollY));
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+
+
+def login_page(message=""):
+    msg = f'<div class="message">{escape(message)}</div>' if message else ""
+    body = f"""
+    <div class="logo-title">FE Portal</div>
+    {msg}
+    <div class="login-card">
+        <form action="/login" method="post">
+            <label>ID</label><input name="login_id" placeholder="ID" required>
+            <label>パスワード</label><input type="password" name="password" placeholder="パスワード" required>
+            <button type="submit">ログイン</button>
+        </form>
+    </div>
+    
+    """
+    return layout("FE Portal ログイン", body, user=None, show_nav=False)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root(request: Request):
+    user = await current_user(request)
+    if user:
+        return redirect("/portal")
+    return login_page()
+
+
+
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings(request: Request):
+    user=await require_login(request)
+    if not user:
+        return redirect("/")
+    body=f"""
+    <h2>設定</h2>
+    <div class='box'>
+    氏名：{escape(user['name'])}<br>
+    ID：{escape(user['login_id'])}<br>
+    ステータス：{escape(user.get('status','')) if hasattr(user,'get') else ''}
+    </div>
+    <form action='/change-password' method='post'>
+    <label>現在のパスワード</label><input type='password' name='current_password' required>
+    <label>新しいパスワード</label><input type='password' name='new_password' required>
+    <label>新しいパスワード（確認）</label><input type='password' name='confirm_password' required>
+    <button type='submit'>パスワード変更</button>
+    </form>
+    <a class='btn back' href='/portal'>戻る</a>
+    """
+    return layout("設定", body, user=user)
+
+@app.post("/change-password")
+async def change_password(request: Request, current_password: str = Form(...), new_password: str = Form(...), confirm_password: str = Form(...)):
+    user=await require_login(request)
+    if not user:
+        return redirect('/')
+    if new_password != confirm_password:
+        return HTMLResponse("<script>alert('新しいパスワードが一致しません');history.back();</script>")
+    conn=db_connect(); cur=conn.cursor()
+    await cur.execute('SELECT * FROM users WHERE login_id=?',(user['login_id'],))
+    row=cur.fetchone()
+    if not row or not await verify_password(current_password, row['password']):
+        conn.close()
+        return HTMLResponse("<script>alert('現在のパスワードが違います');history.back();</script>")
+    await cur.execute('UPDATE users SET password=? WHERE login_id=?',(await hash_password(new_password),user['login_id']))
+    await conn.commit(); conn.close()
+    return HTMLResponse("<script>alert('パスワードを変更しました');window.location='/portal';</script>")
+
+
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page():
+    body = """
+    <div class="logo-title">新規登録</div>
+    <div class="login-card">
+        <form action="/register" method="post">
+            <label>名前</label><input name="name" placeholder="例：山田太郎" required>
+            <label>ID</label><input name="login_id" placeholder="ログインに使うID" required>
+            <label>パスワード</label><input type="password" name="password" placeholder="パスワード" required>
+            <button type="submit">登録する</button>
+        </form>
+        <a class="btn back" href="/">ログイン画面へ戻る</a>
+    </div>
+    """
+    return layout("新規登録", body, show_nav=False)
+
+
+
+
+@app.get("/portal", response_class=HTMLResponse)
+async def portal(request: Request):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    admin_card = '<div class="card" onclick="location.href=\'/admin\'">管理画面</div>' if is_admin_user(user) else '<div class="card" onclick="location.href=\'/opinion\'">意見箱</div>'
+    body = f"""
+    <h2>FEポータル</h2>
+    <div class="grid">
+        <div class="card" onclick="location.href='/shift'">シフト提出</div>
+        <div class="card" onclick="location.href='/myshift'">マイシフト</div>
+        <div class="card" onclick="location.href='/shift-table'">シフト表</div>
+        <div class="card" onclick="location.href='/salary'">給与明細</div>
+        {admin_card}
+        <div class="card" onclick="location.href='/settings'">設定</div>
+        <div class="card" onclick="location.href='/logout'">ログアウト</div>
+    </div>
+    """
+    return layout("FEポータル", body, user=user)
+
+
+@app.get("/shift", response_class=HTMLResponse)
+async def shift(request: Request, saved: int = 0):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    year, month, start_day, end_day, deadline, remaining_text = await get_shift_period()
+    start_date = f"{year}-{month:02d}-{start_day:02d}"
+    end_date = f"{year}-{month:02d}-{end_day:02d}"
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("SELECT * FROM shifts WHERE user_id = ? AND date BETWEEN ? AND ?", (user["login_id"], start_date, end_date))
+    saved_rows = {r["date"]: r for r in cur.fetchall()}
+    conn.close()
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    rows = ""
+    for d in range(start_day, end_day + 1):
+        this_date = date(year, month, d)
+        youbi = weekdays[this_date.weekday()]
+        date_label = f"{month:02d}/{d:02d}({youbi})"
+        date_value = f"{year}-{month:02d}-{d:02d}"
+        r = saved_rows.get(date_value)
+        submitted = r is not None
+        day_class = "saturday" if youbi == "土" else "sunday" if youbi == "日" else ""
+        checked = "checked" if submitted else ""
+        submitted_class = "submitted" if submitted else ""
+        date_class = "submitted-date" if submitted else ""
+        delete_panel = ""
+        if submitted:
+            delete_panel = f"""
+            <div id="delete-{date_value}" class="delete-panel">
+                <a class="btn danger small-btn" href="/delete-my-shift/{date_value}">削除</a>
+            </div>
+            """
+        rows += f"""
+        <div class="shift-row {submitted_class}">
+            <input type="checkbox" name="selected_dates" value="{date_value}" {checked}>
+            <a class="date-link {day_class} {date_class}" onclick="toggleDelete('delete-{date_value}')">{date_label}</a>
+            <select name="start_{date_value}">{time_options(r['start'] if submitted else '')}</select>
+            <select name="end_{date_value}">{time_options(r['end'] if submitted else '')}</select>
+            <select name="limit_{date_value}">{limit_options(r['limit_hour'] if submitted else '指定しない')}</select>
+            {delete_panel}
+        </div>
+        """
+    msg = '<div class="message">シフト提出済み</div>' if saved else ""
+    button_class = "submitted-btn" if saved_rows else ""
+    button_text = "提出済み" if saved_rows else "提出する"
+    deadline_iso = datetime.combine(deadline, datetime.max.time()).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+    body = f"""
+    <h2>シフト提出</h2>
+    {msg}
+    <div class="box">
+        <div>提出締切</div>
+        <div class="deadline">{deadline.strftime('%Y/%m/%d')} 23:59</div>
+        <div>残り時間</div>
+        <div id="shift-countdown" class="summary-num" data-deadline="{deadline_iso}">{remaining_text}</div>
+    </div>
+    <div class="box"><b>提出対象</b><br>{year}年{month}月{start_day}日〜{end_day}日<br><small>※締切後は自動で次の提出期間に切り替わります。</small></div>
+    <form action="/shift-submit" method="post" onsubmit="return preventDoubleSubmit(this);">
+        <label>名前</label><input value="{escape(user['name'])}" readonly style="background:#f0f0f0; color:#555;">
+        <br><br>{rows}
+        <label>メモ</label><textarea name="memo" placeholder="終電、テスト期間など"></textarea>
+        <button class="{button_class}" type="submit">{button_text}</button>
+    </form>
+    <a class="btn back" href="/portal">戻る</a>
+
+    <script>
+    function updateShiftCountdown() {{
+        const el = document.getElementById("shift-countdown");
+        if (!el) return;
+        const deadline = new Date(el.dataset.deadline);
+        const now = new Date();
+        let diff = Math.floor((deadline - now) / 1000);
+        if (diff <= 0) {{
+            el.textContent = "締切を過ぎました";
+            return;
+        }}
+        const days = Math.floor(diff / 86400);
+        diff %= 86400;
+        const hours = Math.floor(diff / 3600);
+        diff %= 3600;
+        const mins = Math.floor(diff / 60);
+        const secs = diff % 60;
+        if (days > 0) {{
+            el.textContent = `${{days}}日 ${{hours}}時間 ${{mins}}分`;
+        }} else if (hours > 0) {{
+            el.textContent = `${{hours}}時間 ${{mins}}分 ${{secs}}秒`;
+        }} else {{
+            el.textContent = `${{mins}}分 ${{secs}}秒`;
+        }}
+    }}
+    setInterval(updateShiftCountdown, 1000);
+    updateShiftCountdown();
+
+    function preventDoubleSubmit(form) {{
+        const btn = form.querySelector('button[type="submit"]');
+        if (btn) {{
+            if (btn.dataset.submitted === "1") return false;
+            btn.dataset.submitted = "1";
+            btn.disabled = true;
+            btn.textContent = "送信中...";
+        }}
+        return true;
+    }}
+    </script>
+    """
+    return layout("シフト提出", body, user=user)
+
+
+@app.post("/shift-submit")
+async def shift_submit(request: Request):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    form = await request.form()
+    name = user["name"]
+    memo = form.get("memo", "")
+    selected_dates = set(form.getlist("selected_dates"))
+    year, month, start_day, end_day, _, _ = await get_shift_period()
+    start_date = f"{year}-{month:02d}-{start_day:02d}"
+    end_date = f"{year}-{month:02d}-{end_day:02d}"
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    # D1 batch commits replacement atomically; one range DELETE also keeps
+    # monthly submissions below the per-request query budget.
+    await cur.execute("""
+    DELETE FROM shifts WHERE user_id = ? AND date BETWEEN ? AND ?
+    AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
+    """, (user["login_id"], start_date, end_date))
+
+    for d in range(start_day, end_day + 1):
+        date_value = f"{year}-{month:02d}-{d:02d}"
+        start = form.get(f"start_{date_value}", "")
+        end = form.get(f"end_{date_value}", "")
+        limit_hour = form.get(f"limit_{date_value}", "指定しない")
+        should_save = date_value in selected_dates or start or end or limit_hour not in ("", "指定しない")
+
+        if should_save:
+            await cur.execute("""
+            INSERT INTO shifts (user_id, name, date, start, end, limit_hour, memo, confirmed, cut, cut_memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '')
+            """, (user["login_id"], name, date_value, start, end, limit_hour, memo))
+
+    await conn.commit()
+    conn.close()
+    return redirect("/shift?saved=1")
+
+
+@app.post("/delete-my-shift/{date_value}")
+async def delete_my_shift(date_value: str, request: Request):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("""
+    DELETE FROM shifts
+    WHERE user_id = ? AND date = ?
+      AND IFNULL(confirmed, 0) = 0
+      AND IFNULL(limit_hour, '') NOT IN ('管理者追加', 'ヘルプ承認')
+    """, (user["login_id"], date_value))
+    await conn.commit(); conn.close()
+    return redirect("/shift")
+
+
+def calendar_html(year, month, rows):
+    # マイシフト上部のカレンダーには、管理者が確定したシフトだけ表示する。
+    # 同じ日に複数シフトがある場合は複数行で表示する。
+    shifts = {}
+    for r in rows:
+        if int(r["cut"] or 0) == 0 and int(r["confirmed"] or 0) == 1:
+            shifts.setdefault(r["date"], []).append(r)
+
+    first_wd = date(year, month, 1).weekday()  # 月=0
+    last_day = monthrange(year, month)[1]
+    heads = ["月", "火", "水", "木", "土", "日"]
+    heads = ["月", "火", "水", "木", "金", "土", "日"]
+    html = '<div class="calendar">'
+    for h in heads:
+        html += f'<div class="cal-head">{h}</div>'
+    for _ in range(first_wd):
+        html += '<div class="cal-day" style="opacity:.35"></div>'
+    today_iso = jst_today().isoformat()
+    for d in range(1, last_day + 1):
+        day = f"{year}-{month:02d}-{d:02d}"
+        cls = " today" if day == today_iso else ""
+        item = ""
+        if day in shifts:
+            for r in shifts[day]:
+                item += f'<div class="cal-shift">{escape(r["start"] or "--:--")}-{escape(r["end"] or "--:--")}</div>'
+        html += f'<div class="cal-day{cls}"><div class="cal-date">{d}</div>{item}</div>'
+    html += '</div>'
+    return html
+
+
+@app.get("/myshift", response_class=HTMLResponse)
+async def myshift(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    today = jst_today(); year = year or today.year; month = month or today.month
+    start_month = f"{year}-{month:02d}-01"; end_month = f"{year}-{month:02d}-{monthrange(year, month)[1]:02d}"
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("SELECT * FROM shifts WHERE user_id = ? AND date BETWEEN ? AND ? ORDER BY date ASC", (user["login_id"], start_month, end_month))
+    rows = cur.fetchall(); conn.close()
+    confirmed_rows = [r for r in rows if int(r["confirmed"] or 0) == 1 and int(r["cut"] or 0) == 0]
+    total = sum(calc_hours(r["start"], r["end"]) for r in confirmed_rows)
+    body = f"""
+    <h2>マイシフト</h2>
+    <form class="month-form" action="/myshift" method="get">
+        <div><label>年</label><input type="number" name="year" value="{year}"></div>
+        <div><label>月</label><input type="number" name="month" value="{month}"></div>
+        <button type="submit">表示</button>
+    </form>
+    {calendar_html(year, month, confirmed_rows)}
+    <div class="summary"><div class="box"><div>提出回数</div><div class="summary-num">{len(rows)}</div></div><div class="box"><div>確定シフト合計時間</div><div class="summary-num">{total:.1f}</div></div></div>
+    """
+    if not rows:
+        body += '<div class="box">この月のシフトはまだありません。</div>'
+    for r in rows:
+        state = "確定" if int(r["confirmed"] or 0) == 1 else "削り" if int(r["cut"] or 0) == 1 else "提出済み"
+        body += f"""
+        <div class="box">
+            <b>{escape(r['date'])}</b><br>
+            {escape(r['start'] or '--:--')} - {escape(r['end'] or '--:--')}<br>
+            希望：{escape(r['limit_hour'] or '指定しない')}<br>
+            状態：{state}<br>
+            メモ：{escape(r['memo'] or '')}
+        </div>
+        """
+    body += '<a class="btn back" href="/portal">戻る</a>'
+    return layout("マイシフト", body, user=user)
+
+
+def help_segments(shifts):
+    """固定ヘルプ枠。
+    朝：09:00-10:00 を3枠
+    夜：21:00-22:00 を3枠
+
+    その時間帯に入っているシフト人数を数え、不足分だけ表示する。
+    それ以外の時間帯にはヘルプを出さない。
+    """
+    fixed_slots = [
+        (9.0, 10.0, 3),
+        (21.0, 22.0, 3),
+    ]
+
+    segments = []
+    for hs, he, required in fixed_slots:
+        count = 0
+        for r in shifts:
+            if int(r["cut"] or 0) == 1:
+                continue
+            st = parse_time_to_hour(r["start"])
+            en = parse_time_to_hour(r["end"])
+            if st is None or en is None:
+                continue
+
+            # ヘルプ時間帯と少しでも重なっている人を人数として数える
+            if st < he and en > hs:
+                count += 1
+
+        deficit = required - count
+        if deficit > 0:
+            segments.append((hs, he, deficit))
+
+    return segments
+
+
+
+
+async def get_help_applications(start_date, end_date, include_all=False):
+    conn = db_connect()
+    cur = conn.cursor()
+    if include_all:
+        await cur.execute("""
+        SELECT * FROM help_applications
+        WHERE date BETWEEN ? AND ?
+        ORDER BY date ASC, start ASC, id ASC
+        """, (start_date, end_date))
+    else:
+        await cur.execute("""
+        SELECT * FROM help_applications
+        WHERE date BETWEEN ? AND ? AND status = 'pending'
+        ORDER BY date ASC, start ASC, id ASC
+        """, (start_date, end_date))
+    rows = cur.fetchall()
+    conn.close()
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["date"], []).append(r)
+    return grouped
+
+
+def fmt_hour(h):
+    hh = int(h)
+    mm = "30" if abs(h - hh - 0.5) < 0.01 else "00"
+    return f"{hh:02d}:{mm}"
+
+
+def hour_to_str(h):
+    return fmt_hour(h)
+
+async def timeline_html(day, shifts, published, admin=False, manage=False, year=None, month=None, help_apps=None, viewer=None):
+    help_apps = help_apps or []
+    dt = date.fromisoformat(day)
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    today_flag = "1" if day == jst_today().isoformat() else "0"
+    today_class = "today" if day == jst_today().isoformat() else ""
+    lock = "" if published or admin or manage else '<div class="lock-mark">🔒</div>'
+    memo = await get_day_memo(day)
+    memo_chip = ""
+    if memo and (published or admin or manage):
+        memo_title = f"{dt.month}/{dt.day} メモ"
+        memo_title_js = escape(json.dumps(memo_title, ensure_ascii=False), quote=True)
+        memo_js = escape(json.dumps(memo, ensure_ascii=False), quote=True)
+        memo_chip = (
+            f'<div class="day-memo-chip" onclick="showDayMemo({memo_title_js}, {memo_js})">'
+            f'📌{escape(short_memo(memo, 16))}</div>'
+        )
+    html = f"""
+    <div id="day-{day}" class="day-card {today_class}" data-today="{today_flag}" data-date="{day}">
+        <div class="day-head">
+            <div class="day-label"><div class="dow">{weekdays[dt.weekday()]}</div><div class="date-num">{dt.day}</div>{lock}{memo_chip}</div>
+            <div class="day-main">
+    """
+
+    if manage:
+        pub = await is_published(day)
+        state = "公開中" if pub else "非公開"
+        val = 0 if pub else 1
+        action = "非公開" if pub else "公開"
+        state_class = "publish-state state-on" if pub else "publish-state state-off"
+        btn_class = "pub-off" if pub else "pub-on"
+        add_url = f"/admin-shift-new?year={year}&month={month}&day={day}"
+        html += f"""
+        <div class="day-publish-control">
+            <span id="pub-state-{day}" class="{state_class}">{state}</span>
+            <a id="pub-btn-{day}" class="btn small-btn publish-btn {btn_class}" href="/set-publish/{day}/{val}" onclick="setPublishAjax('{day}', {val}); return false;">{action}</a>
+            <a class="btn small-btn confirm" href="{add_url}">＋追加</a>
+        </div>
+        """
+
+    html += """
+            <div class="timeline-wrap"><div class="timeline">
+    """
+    for h in range(START_HOUR, END_HOUR + 1):
+        left = (h - START_HOUR) * PX_PER_HOUR
+        html += f'<div class="time-line" style="left:{left}px;"></div><div class="time-label" style="left:{left + 4}px;">{h}</div>'
+
+
+
+    visible = (published or admin or manage)
+    if not visible:
+        html += '<div class="empty-note">非公開</div>'
+    elif not shifts:
+        html += '<div class="empty-note">シフトなし</div>'
+
+    colors = ["#8ac053", "#4fa3a5", "#6b7fd7", "#9b65c9", "#d6b936", "#333333"]
+    y = 28
+
+    if visible:
+        sorted_shifts = sorted(
+            shifts,
+            key=lambda r: (
+                1 if get_user_status(r["user_id"]) == "社員" else 0,
+                parse_time_to_hour(r["start"]) if parse_time_to_hour(r["start"]) is not None else 999,
+                r["name"] or ""
+            )
+        )
+        for i, r in enumerate(sorted_shifts):
+            emp_status = get_user_status(r["user_id"])
+            start_h = parse_time_to_hour(r["start"])
+            end_h = parse_time_to_hour(r["end"])
+            if start_h is None or end_h is None or end_h <= start_h:
+                continue
+            start_h = max(start_h, START_HOUR)
+            end_h = min(end_h, END_HOUR)
+            left = (start_h - START_HOUR) * PX_PER_HOUR
+            width = max((end_h - start_h) * PX_PER_HOUR, 42)
+            color = "#111111" if emp_status == "社員" else colors[i % len(colors)]
+            text = f"{escape(r['name'])} {calc_hours(r['start'], r['end']):.1f}"
+            if int(r["cut"] or 0) == 1:
+                bar_state_class = " cut"
+            elif int(r["confirmed"] or 0) == 1:
+                bar_state_class = ""
+            else:
+                bar_state_class = " pending"
+
+            employee_class = " employee-bar" if emp_status == "社員" else ""
+
+            if manage:
+                panel_id = f"action-{r['id']}"
+                q = f"?year={year}&month={month}" if year and month else ""
+                html += f"""
+                <a class="bar{bar_state_class}{employee_class}" href="javascript:void(0)" onclick="toggleAction('{panel_id}')" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</a>
+                <div id="{panel_id}" class="action-panel" style="left:{left}px; top:{y + 32}px;">
+                    <b>{escape(r['name'])}</b><br>
+                    {escape(r['start'] or '--:--')} - {escape(r['end'] or '--:--')}<br>
+                    <a class="btn confirm" href="/confirm-shift/{r['id']}{q}">確定</a>
+                    <a class="btn danger" href="/cut-shift/{r['id']}{q}">削る</a>
+                    <a class="btn danger" href="/delete-shift-admin/{r['id']}{q}" onclick="return confirm('このシフトを完全に削除します。よろしいですか？');">削除</a>
+                </div>
+                """
+            else:
+                html += f'<div class="bar{bar_state_class}{employee_class}" style="left:{left}px; top:{y}px; width:{width}px; background:{color};">{text}</div>'
+            y += 26
+
+        # ヘルプ応募中バーを表示
+        app_y = max(y + 6, 88)
+        for app in help_apps:
+            st = parse_time_to_hour(app["start"])
+            en = parse_time_to_hour(app["end"])
+            if st is None or en is None or en <= st:
+                continue
+            st = max(st, START_HOUR)
+            en = min(en, END_HOUR)
+            left = (st - START_HOUR) * PX_PER_HOUR
+            width = max((en - st) * PX_PER_HOUR, 80)
+            app_text = f"応募：{escape(app['name'])}"
+            if manage or admin:
+                html += f'<a class="bar help-app" href="/admin-help-action/{app["id"]}?year={year}&month={month}" style="left:{left}px; top:{app_y}px; width:{width}px;">{app_text}</a>'
+            else:
+                if viewer and app["user_id"] == viewer["login_id"]:
+                    html += f'<a class="bar help-app" href="/cancel-help/{app["id"]}" style="left:{left}px; top:{app_y}px; width:{width}px;">応募中 取消</a>'
+                else:
+                    html += f'<div class="bar help-app" style="left:{left}px; top:{app_y}px; width:{width}px;">応募あり</div>'
+            app_y += 26
+
+        # 不足人数ぶん、赤いヘルプバーを複数本表示
+        help_y = max(app_y + 6, 96)
+        for hs, he, deficit in help_segments(shifts):
+            left = (hs - START_HOUR) * PX_PER_HOUR
+            width = max((he - hs) * PX_PER_HOUR, 70)
+            for n in range(deficit):
+                label = "ヘルプ"
+                if manage or admin:
+                    html += f'<div class="bar help-slot" style="left:{left}px; top:{help_y}px; width:{width}px;">{label}</div>'
+                else:
+                    start_s = fmt_hour(hs)
+                    end_s = fmt_hour(he)
+                    html += f'<a class="bar help-slot" href="/help-apply?year={year}&month={month}&date={day}&start={start_s}&end={end_s}&slot={n+1}" style="left:{left}px; top:{help_y}px; width:{width}px;">{label}</a>'
+                help_y += 26
+        if help_y > 120:
+            html += f'<style>#day-{day} .timeline {{ min-height: {help_y + 30}px; }}</style>'
+
+    html += "</div></div></div></div></div>"
+    return html
+
+
+async def build_pass_rate_table(start_date, end_date):
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("""
+    SELECT name, confirmed, cut
+    FROM shifts
+    WHERE date BETWEEN ? AND ?
+    ORDER BY name ASC
+    """, (start_date, end_date))
+    rows = cur.fetchall()
+    conn.close()
+
+    stats = {}
+    for r in rows:
+        name = r["name"] or "未登録"
+        if name not in stats:
+            stats[name] = {"total": 0, "passed": 0, "cut": 0, "pending": 0}
+        stats[name]["total"] += 1
+        if int(r["cut"] or 0) == 1:
+            stats[name]["cut"] += 1
+        elif int(r["confirmed"] or 0) == 1:
+            stats[name]["passed"] += 1
+        else:
+            stats[name]["pending"] += 1
+
+    html = """
+    <div class="box">
+        <h3>希望通過率</h3>
+        <p class="muted">確定したシフト ÷ 提出したシフトで計算</p>
+        <table>
+            <tr>
+                <th>名前</th>
+                <th>希望通過率</th>
+                <th>確定</th>
+                <th>削り</th>
+                <th>未確定</th>
+            </tr>
+    """
+
+    if not stats:
+        html += """
+            <tr><td colspan="5">まだ提出シフトがありません。</td></tr>
+        """
+    else:
+        for name, st in stats.items():
+            total = st["total"]
+            rate = round(st["passed"] / total * 100) if total else 0
+            html += f"""
+            <tr>
+                <td>{escape(name)}</td>
+                <td><b>{rate}%</b></td>
+                <td>{st['passed']}</td>
+                <td>{st['cut']}</td>
+                <td>{st['pending']}</td>
+            </tr>
+            """
+
+    html += """
+        </table>
+    </div>
+    """
+    return html
+
+async def build_shift_table(year, month, admin=False, manage=False, user=None):
+    last_day = monthrange(year, month)[1]
+    start_date = f"{year}-{month:02d}-01"; end_date = f"{year}-{month:02d}-{last_day:02d}"
+    conn = db_connect(); cur = conn.cursor()
+    if manage:
+        # 管理者の提出シフト管理では、確定済み・削り済みも含めて全員を表示する
+        await cur.execute("SELECT * FROM shifts WHERE date BETWEEN ? AND ? ORDER BY date ASC, start ASC", (start_date, end_date))
+    elif admin:
+        await cur.execute("SELECT * FROM shifts WHERE date BETWEEN ? AND ? ORDER BY date ASC, start ASC", (start_date, end_date))
+    else:
+        await cur.execute("SELECT * FROM shifts WHERE date BETWEEN ? AND ? AND confirmed = 1 AND cut = 0 ORDER BY date ASC, start ASC", (start_date, end_date))
+    rows = cur.fetchall(); conn.close()
+    help_grouped = await get_help_applications(start_date, end_date)
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["date"], []).append(r)
+    action = "/admin-shifts" if manage else "/admin-shift-table" if admin else "/shift-table"
+    body = f"""
+    <h2>{'提出シフト管理' if manage else 'シフト表一覧'}</h2>
+    <form class="month-form" action="{action}" method="get">
+        <div><label>年</label><input type="number" name="year" value="{year}"></div>
+        <div><label>月</label><input type="number" name="month" value="{month}"></div>
+        <button type="submit">表示</button>
+    </form>
+    {f'<a class="btn confirm" href="/admin-shift-new?year={year}&month={month}">＋ 新規シフト入力</a>' if manage else ''}
+    """
+    for d in range(1, last_day + 1):
+        day = f"{year}-{month:02d}-{d:02d}"
+        body += await timeline_html(day, grouped.get(day, []), await is_published(day), admin=admin, manage=manage, year=year, month=month, help_apps=help_grouped.get(day, []), viewer=user)
+    if manage:
+        body += await build_pass_rate_table(start_date, end_date)
+    body += '<a class="btn back" href="/admin" >戻る</a>' if manage or admin else '<a class="btn back" href="/portal">戻る</a>'
+    return body
+
+
+@app.get("/shift-table", response_class=HTMLResponse)
+async def shift_table(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    today = jst_today(); year = year or today.year; month = month or today.month
+    return layout("シフト表", await build_shift_table(year, month, admin=False, user=user), user=user)
+
+
+@app.get("/salary", response_class=HTMLResponse)
+async def salary(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+
+    today = jst_today()
+    year = year or today.year
+    month = month or today.month
+    last_day = monthrange(year, month)[1]
+    start_date = f"{year}-{month:02d}-01"
+    end_date = f"{year}-{month:02d}-{last_day:02d}"
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT hourly_wage FROM users WHERE login_id = ?", (user["login_id"],))
+    wage_row = cur.fetchone()
+    hourly_wage = int(wage_row["hourly_wage"] or 0) if wage_row else 0
+
+    # 削られたシフトは給与計算から除外。確定済みがあれば確定済みだけを優先、なければ提出済みを概算に使う。
+    await cur.execute("""
+    SELECT * FROM shifts
+    WHERE user_id = ? AND date BETWEEN ? AND ? AND cut = 0
+    ORDER BY date ASC
+    """, (user["login_id"], start_date, end_date))
+    all_rows = cur.fetchall()
+    confirmed_rows = [r for r in all_rows if int(r["confirmed"] or 0) == 1]
+    rows_for_calc = confirmed_rows if confirmed_rows else all_rows
+    conn.close()
+
+    total_hours = sum(calc_hours(r["start"], r["end"]) for r in rows_for_calc)
+    estimated_pay = int(total_hours * hourly_wage)
+    calc_label = "確定シフトのみで計算" if confirmed_rows else "提出済みシフトで概算"
+
+    details = ""
+    if rows_for_calc:
+        for r in rows_for_calc:
+            h = calc_hours(r["start"], r["end"])
+            details += f"""
+            <tr>
+                <td>{escape(r["date"])}</td>
+                <td>{escape(r["start"] or "--:--")}-{escape(r["end"] or "--:--")}</td>
+                <td>{h:.1f} h</td>
+                <td>{int(h * hourly_wage):,} 円</td>
+            </tr>
+            """
+    else:
+        details = '<tr><td colspan="4">この月の計算対象シフトはありません。</td></tr>'
+
+    body = f"""
+    <h2>給与計算</h2>
+
+    <div class="box">
+        <form action="/salary-wage" method="post">
+            <label>現在の時給</label>
+            <input type="number" name="hourly_wage" value="{hourly_wage}" min="0" placeholder="例：1200">
+            <button type="submit">時給を保存する</button>
+        </form>
+    </div>
+
+    <form class="month-form" action="/salary" method="get">
+        <div><label>年</label><input type="number" name="year" value="{year}"></div>
+        <div><label>月</label><input type="number" name="month" value="{month}"></div>
+        <button type="submit">表示</button>
+    </form>
+
+    <div class="summary">
+        <div class="box"><div>計算対象時間</div><div class="summary-num">{total_hours:.1f} h</div></div>
+        <div class="box"><div>概算給与</div><div class="summary-num">{estimated_pay:,} 円</div></div>
+    </div>
+
+    <div class="box">
+        <b>{calc_label}</b><br>
+        <span style="color:#b00020; font-weight:bold;">注意：</span>
+        この給与計算は、登録された時給とシフト時間から計算した概算です。残業手当、深夜手当、交通費、控除、休憩時間、実際の勤怠打刻などは反映していないため、実際の給与とは異なる場合があります。
+    </div>
+
+    <div class="box">
+        <h3>{year}年{month}月 明細</h3>
+        <table>
+            <tr><th>日付</th><th>時間</th><th>勤務時間</th><th>概算</th></tr>
+            {details}
+        </table>
+    </div>
+
+    <a class="btn back" href="/portal">戻る</a>
+    """
+    return layout("給与計算", body, user=user)
+
+
+@app.post("/salary-wage")
+async def salary_wage(request: Request, hourly_wage: int = Form(...)):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("UPDATE users SET hourly_wage = ? WHERE login_id = ?", (hourly_wage, user["login_id"]))
+    await conn.commit()
+    conn.close()
+    return redirect("/salary")
+
+
+@app.get("/opinion", response_class=HTMLResponse)
+async def opinion(request: Request):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    body = """
+    <h2>意見箱</h2>
+    <form action="/opinion-submit" method="post">
+        <label>意見・要望</label><textarea name="message" rows="8" placeholder="改善してほしいことなど"></textarea>
+        <button type="submit">送信する</button>
+    </form>
+    <a class="btn back" href="/portal">戻る</a>
+    """
+    return layout("意見箱", body, user=user)
+
+
+@app.post("/opinion-submit")
+async def opinion_submit(request: Request, message: str = Form(...)):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("INSERT INTO opinions (user_id, name, message, created_at, status) VALUES (?, ?, ?, ?, 'pending')", (user["login_id"], user["name"], message, jst_now().strftime("%Y-%m-%d %H:%M:%S")))
+    await conn.commit(); conn.close()
+    return HTMLResponse("<script>alert('意見を送信しました！'); window.location='/portal';</script>")
+
+
+async def pending_opinion_count():
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        await cur.execute("SELECT COUNT(*) FROM opinions WHERE IFNULL(status,'pending')='pending'")
+        n = cur.fetchone()[0]
+        conn.close()
+        return int(n or 0)
+    except Exception:
+        return 0
+
+async def pending_help_count():
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        await cur.execute("SELECT COUNT(*) FROM help_applications WHERE status = 'pending'")
+        n = cur.fetchone()[0]
+        conn.close()
+        return int(n or 0)
+    except Exception:
+        return 0
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin(request: Request):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    if not is_admin_user(user):
+        body = '<div class="box">管理者以外はこの画面を表示できません。</div><a class="btn back" href="/portal">戻る</a>'
+        return layout("管理画面", body, user=user)
+
+    pending_help = await pending_help_count()
+    pending_opinion = await pending_opinion_count()
+    help_badge = f"<span class='app-badge'>{pending_help}</span>" if pending_help > 0 else ""
+    opinion_badge = f"<span class='app-badge'>{pending_opinion}</span>" if pending_opinion > 0 else ""
+    notices = ""
+    if pending_help > 0:
+        notices += f"<div class='box notify-box'>ヘルプ応募が <b>{pending_help}</b> 件あります。</div>"
+    if pending_opinion > 0:
+        notices += f"<div class='box notify-box'>未確認の意見が <b>{pending_opinion}</b> 件あります。</div>"
+
+    body = f"""
+    <h2>管理画面</h2>
+    {notices}
+    <div class="grid">
+        <div class="card" onclick="location.href='/admin-shifts'">提出シフト管理</div>
+        <div class="card" onclick="location.href='/admin-submission-status'">シフト提出状況</div>
+        <div class="card" onclick="location.href='/admin-shift-table'">シフト表確認</div>
+        <div class="card" onclick="location.href='/admin-publish'">日付別公開設定</div>
+        <div class="card" onclick="location.href='/admin-shift-settings'">提出ルール設定</div>
+        <div class="card" onclick="location.href='/admin-users'">従業員一覧</div>
+        <div class="card badge-card" onclick="location.href='/admin-help'">ヘルプ応募確認 {help_badge}</div>
+        <div class="card" onclick="location.href='/admin-labor'">人件費計算</div>
+        <div class="card" onclick="location.href='/admin-export-excel'">Excel書き出し</div>
+        <div class="card badge-card" onclick="location.href='/admin-opinions'">意見箱確認 {opinion_badge}</div>
+        <div class="card" onclick="location.href='/admin-backups'">バックアップ</div>
+        <div class="card" onclick="location.href='/portal'">戻る</div>
+    </div>
+    """
+    return layout("管理画面", body, user=user)
+
+
+
+@app.get("/admin-shift-settings", response_class=HTMLResponse)
+async def admin_shift_settings(request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    mode, deadline_day = await get_shift_settings()
+    mode_label = "2週間ごと" if mode == "half_month" else "1ヶ月ごと"
+
+    body = f"""
+    <h2>提出ルール設定</h2>
+    <div class="box">
+        現在の設定：<b>{mode_label}</b> / 提出締切日：<b>{deadline_day}日</b><br>
+        2週間ごとの場合は、<b>{deadline_day}日</b> と <b>{min(deadline_day + 15, 28)}日頃</b> が締切になります。<br>
+        締切日を過ぎると、従業員のシフト提出画面は自動で次の提出期間に切り替わります。
+    </div>
+
+    <form action="/admin-shift-settings" method="post" onsubmit="return confirm('提出ルールを保存しますか？');">
+        <label>提出サイクル</label>
+        <select name="period_mode">
+            <option value="half_month" {"selected" if mode == "half_month" else ""}>2週間ごと（1〜15日 / 16〜月末）</option>
+            <option value="monthly" {"selected" if mode == "monthly" else ""}>1ヶ月ごと</option>
+        </select>
+
+        <label>提出締切日</label>
+        <input type="number" name="deadline_day" value="{deadline_day}" min="1" max="28" required>
+
+        <div class="box">
+            <b>例</b><br>
+            ・2週間ごとで締切日を5日にすると、5日締切と20日締切になります。<br>
+            ・1ヶ月ごとで締切日を20日にすると、毎月20日までに翌月分を提出します。
+        </div>
+
+        <button type="submit">保存する</button>
+    </form>
+    <a class="btn back" href="/admin">戻る</a>
+    """
+    return layout("提出ルール設定", body, user=user, auto_scroll=False)
+
+
+@app.post("/admin-shift-settings")
+async def admin_shift_settings_save(
+    request: Request,
+    period_mode: str = Form("half_month"),
+    deadline_day: int = Form(5)
+):
+    await backup_before_change("before_shift_settings_change")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    if period_mode not in ("half_month", "monthly"):
+        period_mode = "half_month"
+    deadline_day = max(1, min(int(deadline_day or 5), 28))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("""
+    INSERT INTO shift_settings (id, period_mode, deadline_day)
+    VALUES (1, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        period_mode = excluded.period_mode,
+        deadline_day = excluded.deadline_day
+    """, (period_mode, deadline_day))
+    await conn.commit()
+    conn.close()
+
+    return HTMLResponse("<script>alert('提出ルールを保存しました。');location='/admin-shift-settings';</script>")
+
+
+
+@app.get("/admin-submission-status", response_class=HTMLResponse)
+async def admin_submission_status(request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    year, month, start_day, end_day, deadline, remaining_text = await get_shift_period()
+    start_date = f"{year}-{month:02d}-{start_day:02d}"
+    end_date = f"{year}-{month:02d}-{end_day:02d}"
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT login_id, name, status FROM users ORDER BY CAST(login_id AS INTEGER) ASC, login_id ASC")
+    employees = cur.fetchall()
+
+    rows = []
+    submitted_count = 0
+    for emp in employees:
+        await cur.execute("""
+        SELECT COUNT(*) AS c
+        FROM shifts
+        WHERE user_id = ? AND date BETWEEN ? AND ?
+        """, (emp["login_id"], start_date, end_date))
+        count = cur.fetchone()["c"]
+        submitted = count > 0
+        if submitted:
+            submitted_count += 1
+        rows.append((emp, count, submitted))
+    conn.close()
+
+    total = len(employees)
+    percent = int(submitted_count / total * 100) if total else 0
+
+    body = f"""
+    <h2>シフト提出状況</h2>
+    <div class="summary">
+        <div class="box"><div>提出済み</div><div class="summary-num">{submitted_count}/{total}人</div></div>
+        <div class="box"><div>提出率</div><div class="summary-num">{percent}%</div></div>
+    </div>
+    <div class="box">
+        対象期間：<b>{year}年{month}月{start_day}日〜{end_day}日</b><br>
+        提出締切：<b>{deadline.strftime('%Y/%m/%d')} 23:59</b><br>
+        残り時間：<b id="admin-submission-countdown" data-deadline="{datetime.combine(deadline, datetime.max.time()).replace(hour=23, minute=59, second=59, microsecond=0).isoformat()}">{remaining_text}</b>
+    </div>
+    <table>
+        <tr><th>名前</th><th>ID</th><th>提出数</th><th>状態</th></tr>
+    """
+
+    for emp, count, submitted in rows:
+        state = '<span class="status-ok">提出済み</span>' if submitted else '<span class="status-ng">未提出</span>'
+        body += f"""
+        <tr>
+            <td>{escape(emp['name'])}</td>
+            <td>{escape(emp['login_id'])}</td>
+            <td>{count}</td>
+            <td>{state}</td>
+        </tr>
+        """
+
+    body += """
+    </table>
+    <script>
+    function updateAdminSubmissionCountdown(){
+        const el = document.getElementById('admin-submission-countdown');
+        if(!el) return;
+        const deadline = new Date(el.dataset.deadline);
+        let diff = Math.floor((deadline - new Date()) / 1000);
+        if(diff <= 0){
+            el.textContent = '締切を過ぎました';
+            return;
+        }
+        const days = Math.floor(diff / 86400);
+        diff %= 86400;
+        const hours = Math.floor(diff / 3600);
+        diff %= 3600;
+        const mins = Math.floor(diff / 60);
+        const secs = diff % 60;
+        if(days > 0){
+            el.textContent = `${days}日 ${hours}時間 ${mins}分`;
+        }else if(hours > 0){
+            el.textContent = `${hours}時間 ${mins}分 ${secs}秒`;
+        }else{
+            el.textContent = `${mins}分 ${secs}秒`;
+        }
+    }
+    setInterval(updateAdminSubmissionCountdown, 1000);
+    updateAdminSubmissionCountdown();
+    </script>
+    <a class="btn back" href="/admin">戻る</a>
+    """
+    return layout("シフト提出状況", body, user=user)
+
+
+@app.get("/admin-shifts", response_class=HTMLResponse)
+async def admin_shifts(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    today = jst_today(); year = year or today.year; month = month or today.month
+    return layout("提出シフト管理", await build_shift_table(year, month, manage=True, user=user), user=user, auto_scroll=False)
+
+
+
+@app.get("/admin-shift-new", response_class=HTMLResponse)
+async def admin_shift_new(request: Request, year: int = None, month: int = None, day: str = ""):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    today = jst_today()
+    year = year or today.year
+    month = month or today.month
+    default_day = day or f"{year}-{month:02d}-{min(today.day, monthrange(year, month)[1]):02d}"
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT login_id, name, status FROM users ORDER BY CAST(login_id AS INTEGER) ASC, login_id ASC")
+    users = cur.fetchall()
+    conn.close()
+
+    options = ""
+    for u in users:
+        label = f"{u['login_id']} {u['name']}"
+        if "status" in u.keys() and u["status"]:
+            label += f"（{u['status']}）"
+        options += f'<option value="{escape(u["login_id"])}">{escape(label)}</option>'
+
+    body = f"""
+    <h2>新規シフト入力</h2>
+    <div class="box">
+        管理者が直接シフトを追加できます。追加したシフトは確定済みとして保存されます。
+    </div>
+
+    <form action="/admin-shift-new" method="post">
+        <input type="hidden" name="return_year" value="{year}">
+        <input type="hidden" name="return_month" value="{month}">
+
+        <label>従業員</label>
+        <select name="user_id" required>
+            {options}
+        </select>
+
+        <label>日付</label>
+        <input type="date" name="shift_date" value="{default_day}" required>
+
+        <label>開始</label>
+        <select name="start" required>{time_options()}</select>
+
+        <label>終了</label>
+        <select name="end" required>{time_options()}</select>
+
+        <label>備考</label>
+        <textarea name="memo" placeholder="例：急な追加、代理出勤、店長依頼など"></textarea>
+
+        <button type="submit">シフトを追加する</button>
+    </form>
+
+    <a class="btn back" href="/admin-shifts?year={year}&month={month}#day-{default_day}">提出シフト管理へ戻る</a>
+    <a class="btn back" href="/admin-shift-table?year={year}&month={month}#day-{default_day}">シフト表確認へ戻る</a>
+    """
+    return layout("新規シフト入力", body, user=user, auto_scroll=False)
+
+
+@app.post("/admin-shift-new")
+async def admin_shift_new_submit(
+    request: Request,
+    user_id: str = Form(...),
+    shift_date: str = Form(...),
+    start: str = Form(...),
+    end: str = Form(...),
+    memo: str = Form(""),
+    return_year: int = Form(0),
+    return_month: int = Form(0)
+):
+    await backup_before_change("before_manual_shift_add")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    start_h = parse_time_to_hour(start)
+    end_h = parse_time_to_hour(end)
+    if start_h is None or end_h is None or end_h <= start_h:
+        return HTMLResponse("<script>alert('開始時間と終了時間を正しく入力してください。'); history.back();</script>")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users WHERE login_id = ?", (user_id,))
+    target = cur.fetchone()
+    if not target:
+        conn.close()
+        return HTMLResponse("<script>alert('従業員が見つかりません。'); history.back();</script>")
+
+    await cur.execute("""
+    INSERT INTO shifts (user_id, name, date, start, end, limit_hour, memo, confirmed, cut, cut_memo)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, '')
+    """, (target["login_id"], target["name"], shift_date, start, end, "管理者追加", memo or "管理者追加"))
+
+    await conn.commit()
+    conn.close()
+
+    try:
+        y = int(return_year) if return_year else int(shift_date.split("-")[0])
+        m = int(return_month) if return_month else int(shift_date.split("-")[1])
+    except Exception:
+        y, m = jst_today().year, jst_today().month
+
+    return redirect(f"/admin-shifts?year={y}&month={m}&no_auto_scroll=1#day-{shift_date}")
+
+
+@app.post("/delete-shift-admin/{shift_id}")
+async def delete_shift_admin(shift_id: int, request: Request, year: int = None, month: int = None):
+    await backup_before_change("before_shift_delete")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT date FROM shifts WHERE id = ?", (shift_id,))
+    row = cur.fetchone()
+    target_date = row["date"] if row else ""
+    await cur.execute("DELETE FROM shifts WHERE id = ?", (shift_id,))
+    await conn.commit()
+    conn.close()
+
+    if target_date:
+        try:
+            y = year or int(target_date.split("-")[0])
+            m = month or int(target_date.split("-")[1])
+            return redirect(f"/admin-shifts?year={y}&month={m}&no_auto_scroll=1#day-{target_date}")
+        except Exception:
+            pass
+
+    return redirect(f"/admin-shifts?year={year or jst_today().year}&month={month or jst_today().month}")
+
+
+@app.get("/admin-shift-action/{shift_id}", response_class=HTMLResponse)
+async def admin_shift_action(shift_id: int, request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor(); await cur.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,)); r = cur.fetchone(); conn.close()
+    if not r:
+        return redirect("/admin-shifts")
+    body = f"""
+    <h2>シフト操作</h2>
+    <div class="box">
+        <b>{escape(r['name'])}</b><br>
+        {escape(r['date'])}<br>
+        {escape(r['start'] or '--:--')} - {escape(r['end'] or '--:--')}<br>
+        希望：{escape(r['limit_hour'] or '')}<br>
+        現在：{'削り済み' if int(r['cut'] or 0) == 1 else '未確定'}
+    </div>
+    <a class="btn confirm" href="/confirm-shift/{r['id']}?year={year or jst_today().year}&month={month or jst_today().month}">確定する</a>
+    <a class="btn danger" href="/cut-shift/{r['id']}?year={year or jst_today().year}&month={month or jst_today().month}">削る</a>
+    <a class="btn back" href="/admin-shifts?year={year or jst_today().year}&month={month or jst_today().month}">戻る</a>
+    """
+    return layout("シフト操作", body, user=user)
+
+
+@app.post("/confirm-shift/{shift_id}")
+async def confirm_shift(shift_id: int, request: Request, year: int = None, month: int = None):
+    await backup_before_change("before_shift_confirm")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("UPDATE shifts SET confirmed = 1, cut = 0 WHERE id = ?", (shift_id,))
+    await conn.commit(); conn.close()
+    return redirect(f"/admin-shifts?year={year or jst_today().year}&month={month or jst_today().month}")
+
+
+@app.post("/cut-shift/{shift_id}")
+async def cut_shift(shift_id: int, request: Request, year: int = None, month: int = None):
+    await backup_before_change("before_shift_cut")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("UPDATE shifts SET cut = 1, confirmed = 0, cut_memo = ? WHERE id = ?", (jst_now().strftime("%Y-%m-%d %H:%M"), shift_id))
+    await conn.commit(); conn.close()
+    return redirect(f"/admin-shifts?year={year or jst_today().year}&month={month or jst_today().month}")
+
+
+@app.get("/admin-shift-table", response_class=HTMLResponse)
+async def admin_shift_table(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    today = jst_today(); year = year or today.year; month = month or today.month
+    return layout("管理用シフト表", await build_shift_table(year, month, admin=True, user=user), user=user)
+
+
+@app.get("/admin-publish", response_class=HTMLResponse)
+async def admin_publish(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    today = jst_today(); year = year or today.year; month = month or today.month
+    last_day = monthrange(year, month)[1]
+    body = f"""
+    <h2>日付別公開設定</h2>
+    <form class="month-form" action="/admin-publish" method="get">
+        <div><label>年</label><input type="number" name="year" value="{year}"></div>
+        <div><label>月</label><input type="number" name="month" value="{month}"></div>
+        <button type="submit">表示</button>
+    </form>
+    <table class="publish-table"><tr><th>日付</th><th>状態</th><th>操作</th><th>メモ</th></tr>
+    """
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    for d in range(1, last_day + 1):
+        day = f"{year}-{month:02d}-{d:02d}"
+        dt = date.fromisoformat(day)
+        pub = await is_published(day)
+        state = "公開中" if pub else "非公開"
+        action = "非公開にする" if pub else "公開する"
+        val = 0 if pub else 1
+        state_class = "publish-state state-on" if pub else "publish-state state-off"
+        btn_class = "pub-off" if pub else "pub-on"
+        memo_value = escape(await get_day_memo(day))
+        body += f"""<tr id="pub-row-{day}">
+            <td style="vertical-align:middle;text-align:center;">{month}/{d}({weekdays[dt.weekday()]})</td>
+            <td style="vertical-align:middle;text-align:center;">
+                <span id="pub-state-{day}" class="{state_class}" style="display:inline-flex;align-items:center;justify-content:center;min-width:64px;height:32px;line-height:1;margin:0 auto;">{state}</span>
+            </td>
+            <td style="vertical-align:middle;text-align:center;">
+                <a id="pub-btn-{day}" class="btn small-btn publish-btn {btn_class}" href="/set-publish/{day}/{val}" onclick="setPublishAjax('{day}', {val}); return false;">{action}</a>
+            </td>
+            <td style="vertical-align:middle;text-align:left;">
+                <form action="/set-day-memo" method="post" style="margin:0;">
+                    <input type="hidden" name="day" value="{day}">
+                    <input type="hidden" name="year" value="{year}">
+                    <input type="hidden" name="month" value="{month}">
+                    <textarea name="memo" rows="2" placeholder="連絡事項">{memo_value}</textarea>
+                    <button class="small-btn" type="submit">保存</button>
+                </form>
+            </td>
+        </tr>"""
+    body += "</table><a class='btn back' href='/admin'>戻る</a>"
+    return layout("公開設定", body, user=user)
+
+
+@app.post("/set-publish/{day}/{value}")
+async def set_publish(day: str, value: int, request: Request, ajax: int = 0):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        if ajax:
+            return JSONResponse({"ok": False, "error": "not_admin"}, status_code=403)
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("INSERT INTO published_days (date, published) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET published = excluded.published", (day, value))
+    await conn.commit(); conn.close()
+    if ajax:
+        return JSONResponse({"ok": True, "day": day, "published": value})
+    y, m, _ = day.split("-")
+    return redirect(f"/admin-publish?year={int(y)}&month={int(m)}#pub-row-{day}")
+
+
+
+@app.post("/set-day-memo")
+async def set_day_memo(request: Request, day: str = Form(...), memo: str = Form(""), year: int = Form(None), month: int = Form(None)):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("INSERT INTO day_memos (date, memo) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET memo = excluded.memo", (day, memo.strip()))
+    await conn.commit()
+    conn.close()
+    y = year or int(day.split("-")[0])
+    m = month or int(day.split("-")[1])
+    return redirect(f"/admin-publish?year={y}&month={m}#pub-row-{day}")
+
+
+
+@app.get("/help-apply", response_class=HTMLResponse)
+async def help_apply(request: Request, date: str, start: str, end: str, slot: int = 1, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+    try:
+        parts = str(date).split("-")
+        ret_y = int(year or parts[0])
+        ret_m = int(month or parts[1])
+    except Exception:
+        today = jst_today()
+        ret_y = today.year
+        ret_m = today.month
+
+    body = f"""
+    <h2>ヘルプ応募</h2>
+    <div class="help-note">
+        {escape(date)} のヘルプに応募します。勤務可能な時間を入力してください。
+    </div>
+    <form action="/help-apply-submit" method="post">
+        <input type="hidden" name="return_year" value="{ret_y}">
+        <input type="hidden" name="return_month" value="{ret_m}">
+        <input type="hidden" name="return_date" value="{escape(date)}">
+        <input type="hidden" name="date" value="{escape(date)}">
+        <label>開始</label>
+        <select name="start">{time_options(start)}</select>
+        <label>終了</label>
+        <select name="end">{time_options(end)}</select>
+        <label>コメント（任意）</label>
+        <textarea name="comment" placeholder="例：18時以降なら入れます"></textarea>
+        <button type="submit">応募する</button>
+    </form>
+    <a class="btn back" href="/shift-table?year={ret_y}&month={ret_m}#day-{escape(date)}">戻る</a>
+    """
+    return layout("ヘルプ応募", body, user=user)
+
+
+
+
+@app.post("/help-apply-submit")
+async def help_apply_submit(
+    request: Request,
+    date_value: str = Form(None),
+    date: str = Form(None),
+    start: str = Form(...),
+    end: str = Form(...),
+    comment: str = Form("")
+):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+
+    target_date = date_value or date
+    if not target_date:
+        return HTMLResponse("<script>alert('日付が取得できませんでした。'); history.back();</script>")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("""
+    INSERT INTO help_applications (user_id, name, date, start, end, comment, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+    """, (user["login_id"], user["name"], target_date, start, end, comment, jst_now().strftime("%Y-%m-%d %H:%M:%S")))
+    await conn.commit()
+    conn.close()
+
+    try:
+        y, m = target_date.split("-")[:2]
+        return redirect(f"/shift-table?year={int(y)}&month={int(m)}&no_auto_scroll=1#day-{target_date}")
+    except Exception:
+        return redirect("/shift-table")
+
+
+
+@app.post("/cancel-help/{app_id}")
+async def cancel_help(app_id: int, request: Request):
+    user = await require_login(request)
+    if not user:
+        return redirect("/")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT date FROM help_applications WHERE id = ? AND user_id = ?", (app_id, user["login_id"]))
+    row = cur.fetchone()
+    target_date = row["date"] if row else ""
+
+    await cur.execute("""
+    UPDATE help_applications
+    SET status = 'canceled'
+    WHERE id = ? AND user_id = ? AND status = 'pending'
+    """, (app_id, user["login_id"]))
+    await conn.commit()
+    conn.close()
+
+    if target_date:
+        try:
+            y, m = target_date.split("-")[:2]
+            return redirect(f"/shift-table?year={int(y)}&month={int(m)}&no_auto_scroll=1#day-{target_date}")
+        except Exception:
+            pass
+
+    return redirect("/shift-table")
+
+
+@app.get("/admin-help", response_class=HTMLResponse)
+async def admin_help(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    today = jst_today(); year = year or today.year; month = month or today.month
+    last_day = monthrange(year, month)[1]
+    start_date = f"{year}-{month:02d}-01"; end_date = f"{year}-{month:02d}-{last_day:02d}"
+    conn = db_connect(); cur = conn.cursor()
+    await cur.execute("SELECT * FROM help_applications WHERE date BETWEEN ? AND ? ORDER BY date ASC, start ASC", (start_date, end_date))
+    rows = cur.fetchall(); conn.close()
+    body = f"""
+    <h2>ヘルプ応募確認</h2>
+    <form class="month-form" action="/admin-help" method="get">
+        <div><label>年</label><input type="number" name="year" value="{year}"></div>
+        <div><label>月</label><input type="number" name="month" value="{month}"></div>
+        <button type="submit">表示</button>
+    </form>
+    """
+    if not rows:
+        body += '<div class="box">ヘルプ応募はありません。</div>'
+    for r in rows:
+        status = "承認済み" if r["status"] == "approved" else "却下" if r["status"] == "rejected" else "未承認"
+        actions = ""
+        if r["status"] == "pending":
+            actions = f"""
+            <a class="btn confirm small-btn" href="/approve-help/{r['id']}?year={year}&month={month}">承認してシフト追加</a>
+            <a class="btn danger small-btn" href="/reject-help/{r['id']}?year={year}&month={month}">却下</a>
+            """
+        body += f"""
+        <div class="box">
+            <b>{escape(r['name'])}</b><br>
+            {escape(r['date'])}　{escape(r['start'])}-{escape(r['end'])}<br>
+            状態：{status}<br>
+            コメント：{escape(r['comment'] or '')}<br>
+            {actions}
+        </div>
+        """
+    body += '<a class="btn back" href="/admin">戻る</a>'
+    return layout("ヘルプ応募確認", body, user=user, auto_scroll=False)
+
+
+@app.get("/admin-help-action/{app_id}", response_class=HTMLResponse)
+async def admin_help_action(app_id: int, request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor(); await cur.execute("SELECT * FROM help_applications WHERE id = ? AND status = 'pending'", (app_id,)); r = cur.fetchone(); conn.close()
+    if not r:
+        return redirect("/admin-help")
+    year = year or int(r["date"].split("-")[0]); month = month or int(r["date"].split("-")[1])
+    body = f"""
+    <h2>ヘルプ応募操作</h2>
+    <div class="box">
+        <b>{escape(r['name'])}</b><br>
+        {escape(r['date'])}<br>
+        {escape(r['start'])} - {escape(r['end'])}<br>
+        コメント：{escape(r['comment'] or '')}<br>
+    </div>
+    <a class="btn confirm" href="/approve-help/{r['id']}?year={year}&month={month}">承認してシフト追加</a>
+    <a class="btn danger" href="/reject-help/{r['id']}?year={year}&month={month}">却下</a>
+    <a class="btn back" href="/admin-shifts?year={year}&month={month}">戻る</a>
+    """
+    return layout("ヘルプ応募操作", body, user=user, auto_scroll=False)
+
+
+
+
+@app.post("/reject-help/{app_id}")
+async def reject_help(app_id: int, request: Request, year: int = None, month: int = None):
+    await backup_before_change("before_help_reject")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor(); await cur.execute("UPDATE help_applications SET status = 'rejected' WHERE id = ? AND status = 'pending'", (app_id,)); await conn.commit(); conn.close()
+    return redirect(f"/admin-help?year={year or jst_today().year}&month={month or jst_today().month}")
+
+
+@app.get("/admin-users", response_class=HTMLResponse)
+async def admin_users(request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users ORDER BY id ASC")
+    rows = cur.fetchall()
+    conn.close()
+
+    body = """
+    <h2>従業員一覧</h2>
+    <div class="box">
+        従業員ごとの「編集する」ボタンから、ID・名前・パスワード・時給を変更できます。
+    </div>
+    <div style="margin:10px 0 16px 0;">
+        <a class="btn confirm" href="/admin-user-new">＋ 新規従業員追加</a>
+    </div>
+    """
+
+    for r in rows:
+        role = "管理者" if int(r["is_admin"] or 0) == 1 else "スタッフ"
+        wage = int(r["hourly_wage"] or 0) if "hourly_wage" in r.keys() else 0
+        emp_status = r["status"] if "status" in r.keys() and r["status"] else "アルバイト"
+
+        admin_actions = ""
+        admin_badge = ' <span style="display:inline-block;background:#111;color:#fff;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:900;vertical-align:middle;">管理者</span>' if int(r["is_admin"] or 0) == 1 else ""
+        if r["login_id"] != user["login_id"]:
+            admin_actions += f'<a class="btn danger small-btn" href="/delete-user-confirm/{r["id"]}" onclick="saveScrollNow()">従業員削除</a>'
+        else:
+            admin_actions += '<span style="font-weight:bold;color:#777;">自分自身は削除不可</span>'
+
+        body += f"""
+        <div class="box employee-row" id="user-{r['id']}">
+            <div style="width:100%;">
+                <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+                    <div>
+                        <div style="font-size:20px;font-weight:900;">{escape(r['name'])}{admin_badge}</div>
+                        <div>ID：<b>{escape(r['login_id'])}</b></div>
+                        <div>権限：<b>{role}</b></div>
+                        <div>ステータス：<b>{escape(emp_status)}</b></div>
+                        <div>時給：<b>{wage:,} 円</b></div>
+                    </div>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <a class="btn small-btn" href="/admin-user-edit/{r['id']}" onclick="saveScrollNow()">編集する</a>
+                        {admin_actions}
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+
+    body += """
+    <script>
+    function saveScrollNow(){
+        sessionStorage.setItem('adminUsersScrollY', String(window.scrollY));
+    }
+    window.addEventListener('load', function(){
+        const y = sessionStorage.getItem('adminUsersScrollY');
+        if(y !== null){
+            window.scrollTo(0, parseInt(y || '0', 10));
+            sessionStorage.removeItem('adminUsersScrollY');
+        }
+    });
+    </script>
+    <a class="btn back" href="/admin">戻る</a>
+    """
+    return layout("従業員一覧", body, user=user)
+
+
+
+@app.get("/admin-user-new", response_class=HTMLResponse)
+async def admin_user_new_page(request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    body = """
+    <h2>新規従業員追加</h2>
+    <div class="box">
+        管理者だけが新規従業員を追加できます。ID・パスワード・時給・ステータスを設定してください。
+    </div>
+    <form action="/admin-user-new" method="post" onsubmit="return confirm('この内容で従業員を追加しますか？');">
+        <label>名前</label>
+        <input name="name" placeholder="例：山田太郎" required>
+
+        <label>ID</label>
+        <input name="login_id" placeholder="例：01" required>
+
+        <label>パスワード</label>
+        <input type="password" name="password" placeholder="初期パスワード" required>
+
+        <label>時給</label>
+        <input type="number" name="hourly_wage" value="0" min="0">
+
+        <label>ステータス</label>
+        <select name="status">
+            <option value="社員">社員</option>
+            <option value="オフィシャルトレーナー">オフィシャルトレーナー</option>
+            <option value="アルバイト" selected>アルバイト</option>
+        </select>
+
+        <button type="submit">追加する</button>
+    </form>
+    <a class="btn back" href="/admin-users">従業員一覧へ戻る</a>
+    """
+    return layout("新規従業員追加", body, user=user, auto_scroll=False)
+
+
+@app.post("/admin-user-new")
+async def admin_user_new_submit(
+    request: Request,
+    name: str = Form(...),
+    login_id: str = Form(...),
+    password: str = Form(...),
+    hourly_wage: int = Form(0),
+    status: str = Form("アルバイト")
+):
+    await backup_before_change("before_user_add")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    name = name.strip()
+    login_id = login_id.strip()
+    password = password
+    status = status.strip() or "アルバイト"
+    if status not in ["社員", "オフィシャルトレーナー", "アルバイト"]:
+        status = "アルバイト"
+
+    if not name or not login_id or not password:
+        return HTMLResponse("<script>alert('名前・ID・パスワードを入力してください。');history.back();</script>")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        await cur.execute("""
+        INSERT INTO users (login_id, password, name, is_admin, hourly_wage, status)
+        VALUES (?, ?, ?, 0, ?, ?)
+        """, (login_id, await hash_password(password), name, int(hourly_wage or 0), status))
+        await conn.commit()
+    except DatabaseConflict:
+        conn.close()
+        return HTMLResponse("<script>alert('そのIDはすでに使われています。');history.back();</script>")
+    conn.close()
+
+    return HTMLResponse("<script>alert('従業員を追加しました。');location='/admin-users';</script>")
+
+
+@app.get("/admin-user-edit/{user_id}", response_class=HTMLResponse)
+async def admin_user_edit_page(user_id: int, request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+    conn.close()
+
+    if not target:
+        return redirect("/admin-users")
+
+    wage = int(target["hourly_wage"] or 0) if "hourly_wage" in target.keys() else 0
+    emp_status = target["status"] if "status" in target.keys() and target["status"] else "アルバイト"
+    role = "管理者" if int(target["is_admin"] or 0) == 1 else "スタッフ"
+
+    body = f"""
+    <h2>従業員情報編集</h2>
+
+    <div class="box">
+        <b>{escape(target['name'])}</b> さんの情報を編集します。<br>
+        IDを変更すると、過去の提出シフト・ヘルプ応募・意見箱データも新しいIDへ移行されます。ステータスは「社員 / オフィシャルトレーナー / アルバイト」から選べます。
+    </div>
+
+    <form action="/admin-user-edit/{user_id}" method="post" onsubmit="return confirm('この従業員情報を保存しますか？\\nIDを変更した場合、過去データも新IDへ移行されます。');">
+        <label>ログインID</label>
+        <input name="login_id" value="{escape(target['login_id'])}" required>
+
+        <label>名前</label>
+        <input name="name" value="{escape(target['name'])}" required>
+
+        <label>ステータス</label>
+        <select name="status">
+            <option value="社員" {"selected" if emp_status == "社員" else ""}>社員</option>
+            <option value="オフィシャルトレーナー" {"selected" if emp_status == "オフィシャルトレーナー" else ""}>オフィシャルトレーナー</option>
+            <option value="アルバイト" {"selected" if emp_status == "アルバイト" else ""}>アルバイト</option>
+        </select>
+
+        <label>新しいパスワード</label>
+        <input type="password" name="password" value="" placeholder="変更しない場合は空欄">
+
+        <label>時給</label>
+        <input type="number" name="hourly_wage" value="{wage}" min="0" placeholder="例：1200">
+
+        <div class="box">
+            現在の権限：<b>{role}</b>
+        </div>
+
+        <button type="submit">保存する</button>
+    </form>
+
+    <div class="box" style="margin-top:18px;">
+        <h3 style="margin-top:0;">管理者権限</h3>
+        <p style="font-weight:800;color:#555;">管理者権限の付与・剥奪には管理者パスワードが必要です。</p>
+        <form action="/admin-user-admin-change/{user_id}" method="post" onsubmit="return confirm('管理者権限を変更しますか？');">
+            <label>管理者パスワード</label>
+            <input type="password" name="admin_password" placeholder="管理者パスワード" required>
+            <input type="hidden" name="action" value="{'revoke' if int(target['is_admin'] or 0) == 1 else 'grant'}">
+            <button class="{'danger' if int(target['is_admin'] or 0) == 1 else 'confirm'}" type="submit">
+                {'管理者権限を剥奪する' if int(target['is_admin'] or 0) == 1 else '管理者にする'}
+            </button>
+        </form>
+    </div>
+
+    <a class="btn back" href="/admin-users">従業員一覧へ戻る</a>
+    """
+    return layout("従業員情報編集", body, user=user)
+
+
+
+@app.post("/admin-user-admin-change/{user_id}")
+async def admin_user_admin_change(
+    user_id: int,
+    request: Request,
+    action: str = Form(""),
+    admin_password: str = Form("")
+):
+    await backup_before_change("before_admin_change")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    if not await verify_password(admin_password, user["password"]):
+        return HTMLResponse("<script>alert('管理者パスワードが違います。');history.back();</script>")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+    if not target:
+        conn.close()
+        return redirect("/admin-users")
+
+    # 自分自身の管理者権限を剥奪すると管理不能になるため禁止
+    if target["login_id"] == user["login_id"] and action == "revoke":
+        conn.close()
+        return HTMLResponse("<script>alert('自分自身の管理者権限は剥奪できません。');history.back();</script>")
+
+    if action == "grant":
+        await cur.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+        msg = "管理者権限を付与しました。"
+    elif action == "revoke":
+        await cur.execute("UPDATE users SET is_admin = 0 WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE is_admin=1)>1", (user_id,))
+        msg = "管理者権限を剥奪しました。"
+    else:
+        conn.close()
+        return HTMLResponse("<script>alert('操作が不正です。');history.back();</script>")
+
+    await conn.commit()
+    conn.close()
+    return HTMLResponse(f"<script>alert('{msg}');location='/admin-user-edit/{user_id}';</script>")
+
+
+@app.post("/admin-user-edit/{user_id}")
+async def admin_user_edit_save(
+    user_id: int,
+    request: Request,
+    login_id: str = Form(""),
+    name: str = Form(""),
+    password: str = Form(""),
+    status: str = Form("アルバイト"),
+    hourly_wage: int = Form(0)
+):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    login_id = login_id.strip()
+    name = name.strip()
+    password = password
+    status = status.strip()
+    if status not in ["社員", "オフィシャルトレーナー", "アルバイト"]:
+        status = "アルバイト"
+
+    if not login_id or not name:
+        return HTMLResponse("""
+        <script>alert('IDと名前は必須です。'); history.back();</script>
+        """)
+
+    if hourly_wage < 0:
+        hourly_wage = 0
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    await cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+    if not target:
+        conn.close()
+        return redirect("/admin-users")
+
+    old_login_id = target["login_id"]
+
+    await cur.execute("SELECT id FROM users WHERE login_id = ? AND id != ?", (login_id, user_id))
+    duplicate = cur.fetchone()
+    if duplicate:
+        conn.close()
+        return HTMLResponse("""
+        <script>alert('そのIDはすでに使われています。'); history.back();</script>
+        """)
+
+    if password:
+        await cur.execute("""
+        UPDATE users
+        SET login_id = ?, name = ?, password = ?, status = ?, hourly_wage = ?
+        WHERE id = ?
+        """, (login_id, name, await hash_password(password), status, hourly_wage, user_id))
+    else:
+        await cur.execute("""
+        UPDATE users
+        SET login_id = ?, name = ?, status = ?, hourly_wage = ?
+        WHERE id = ?
+        """, (login_id, name, status, hourly_wage, user_id))
+
+    # 関連テーブルのIDと名前も更新
+    related_tables = ["shifts", "help_applications", "opinions", "shift_history", "help_history"]
+    for table in related_tables:
+        try:
+            if await has_column(cur, table, "user_id"):
+                await cur.execute(f"UPDATE {table} SET user_id = ? WHERE user_id = ?", (login_id, old_login_id))
+            if await has_column(cur, table, "name"):
+                await cur.execute(f"UPDATE {table} SET name = ? WHERE user_id = ?", (name, login_id))
+        except Exception:
+            pass
+
+    await conn.commit()
+    conn.close()
+
+    res = redirect("/admin-users")
+    return res
+
+
+@app.post("/update-user-info/{user_id}")
+async def update_user_info(
+    user_id: int,
+    request: Request,
+    login_id: str = Form(""),
+    name: str = Form(""),
+    password: str = Form(""),
+    hourly_wage: int = Form(0)
+):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    login_id = login_id.strip()
+    name = name.strip()
+    password = password
+    if hourly_wage < 0:
+        hourly_wage = 0
+
+    if not login_id or not name:
+        return HTMLResponse("""
+        <script>alert('IDと名前は必須です。'); history.back();</script>
+        """)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+    if not target:
+        conn.close()
+        return redirect("/admin-users")
+
+    old_login_id = target["login_id"]
+
+    await cur.execute("SELECT id FROM users WHERE login_id = ? AND id != ?", (login_id, user_id))
+    duplicate = cur.fetchone()
+    if duplicate:
+        conn.close()
+        return HTMLResponse("""
+        <script>alert('そのIDはすでに使われています。'); history.back();</script>
+        """)
+
+    if password:
+        await cur.execute("UPDATE users SET login_id = ?, name = ?, password = ?, hourly_wage = ? WHERE id = ?",
+                    (login_id, name, await hash_password(password), hourly_wage, user_id))
+    else:
+        await cur.execute("UPDATE users SET login_id = ?, name = ?, hourly_wage = ? WHERE id = ?",
+                    (login_id, name, hourly_wage, user_id))
+
+    # IDや名前を変更した場合、関連テーブルもまとめて更新する
+    for table in ["shifts", "help_applications", "opinions"]:
+        try:
+            if await has_column(cur, table, "user_id"):
+                await cur.execute(f"UPDATE {table} SET user_id = ? WHERE user_id = ?", (login_id, old_login_id))
+            if await has_column(cur, table, "name"):
+                await cur.execute(f"UPDATE {table} SET name = ? WHERE user_id = ?", (name, login_id))
+        except Exception:
+            pass
+
+    # もしシフト履歴系テーブルがある場合もできる範囲で更新
+    for table in ["shift_history", "help_history"]:
+        try:
+            if await has_column(cur, table, "user_id"):
+                await cur.execute(f"UPDATE {table} SET user_id = ? WHERE user_id = ?", (login_id, old_login_id))
+            if await has_column(cur, table, "name"):
+                await cur.execute(f"UPDATE {table} SET name = ? WHERE user_id = ?", (name, login_id))
+        except Exception:
+            pass
+
+    await conn.commit()
+    conn.close()
+
+    # 自分自身のIDを変更した場合はCookieも新IDに更新
+    res = redirect("/admin-users")
+    return res
+
+
+@app.post("/update-user-wage/{user_id}")
+async def update_user_wage(user_id: int, request: Request, hourly_wage: int = Form(...)):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    if hourly_wage < 0:
+        hourly_wage = 0
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("UPDATE users SET hourly_wage = ? WHERE id = ?", (hourly_wage, user_id))
+    await conn.commit()
+    conn.close()
+
+    return redirect("/admin-users")
+
+
+@app.get("/delete-user-confirm/{user_id}", response_class=HTMLResponse)
+async def delete_user_confirm(user_id: int, request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+    conn.close()
+
+    if not target:
+        return redirect("/admin-users")
+
+    if target["login_id"] == user["login_id"]:
+        body = """
+        <h2>削除できません</h2>
+        <div class="box">自分自身のアカウントは削除できません。</div>
+        <a class="btn back" href="/admin-users">戻る</a>
+        """
+        return layout("削除できません", body, user=user)
+
+    body = f"""
+    <h2>従業員削除の確認</h2>
+
+    <div class="box" style="border:3px solid #e05252;background:#fff1f1;">
+        <h3 style="color:#d40000;margin-top:0;">⚠ 警告 1</h3>
+        <b>{escape(target['name'])}</b> さんを削除すると、この従業員はログインできなくなります。
+    </div>
+
+    <div class="box" style="border:3px solid #e05252;background:#fff1f1;">
+        <h3 style="color:#d40000;margin-top:0;">⚠ 警告 2</h3>
+        この従業員の提出シフト・確定シフト・ヘルプ応募は、すべてのシフト表から表示されなくなります。
+        この操作は取り消せません。
+    </div>
+
+    <form action="/delete-user/{user_id}" method="post">
+        <label>本当に削除する場合は、下に <b>削除</b> と入力してください</label>
+        <input name="confirm_text" placeholder="削除">
+        <button class="danger" type="submit">本当に削除する</button>
+    </form>
+
+    <a class="btn back" href="/admin-users">キャンセル</a>
+    """
+    return layout("従業員削除", body, user=user)
+
+
+@app.post("/delete-user/{user_id}")
+async def delete_user(user_id: int, request: Request, confirm_text: str = Form("")):
+    await backup_before_change("before_user_delete")
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    target = cur.fetchone()
+
+    if not target:
+        conn.close()
+        return redirect("/admin-users")
+
+    if target["login_id"] == user["login_id"]:
+        conn.close()
+        return redirect("/admin-users")
+
+    if confirm_text.strip() != "削除":
+        conn.close()
+        return redirect(f"/delete-user-confirm/{user_id}")
+
+    target_login_id = target["login_id"]
+
+    # シフト表から完全に表示されないように、関連データを削除
+    await cur.execute("DELETE FROM shifts WHERE user_id = ? AND EXISTS (SELECT 1 FROM users WHERE id=? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1)>1))", (target_login_id,user_id))
+    await cur.execute("DELETE FROM help_applications WHERE user_id = ? AND EXISTS (SELECT 1 FROM users WHERE id=? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1)>1))", (target_login_id,user_id))
+    await cur.execute("DELETE FROM opinions WHERE user_id = ? AND EXISTS (SELECT 1 FROM users WHERE id=? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1)>1))", (target_login_id,user_id))
+    await cur.execute("DELETE FROM users WHERE id = ? AND (is_admin=0 OR (SELECT COUNT(*) FROM users WHERE is_admin=1)>1)", (user_id,))
+
+    await conn.commit()
+    conn.close()
+
+    return redirect("/admin-users")
+
+
+@app.get("/grant-admin/{user_id}")
+async def grant_admin(user_id: int, request: Request):
+    # パスワードなしのURL直打ちによる権限変更は禁止。
+    # 権限変更は /admin-user-edit/{user_id} の下部フォームから行う。
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    return HTMLResponse("<script>alert('管理者権限の変更は、従業員編集画面から管理者パスワードを入力して行ってください。');location='/admin-user-edit/%s';</script>" % user_id)
+
+
+@app.get("/revoke-admin/{user_id}")
+async def revoke_admin(user_id: int, request: Request):
+    # パスワードなしのURL直打ちによる権限変更は禁止。
+    # 権限変更は /admin-user-edit/{user_id} の下部フォームから行う。
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    return HTMLResponse("<script>alert('管理者権限の変更は、従業員編集画面から管理者パスワードを入力して行ってください。');location='/admin-user-edit/%s';</script>" % user_id)
+
+
+@app.get("/admin-opinions", response_class=HTMLResponse)
+async def admin_opinions(request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect(); cur = conn.cursor(); await cur.execute("SELECT * FROM opinions ORDER BY id DESC")
+    rows = cur.fetchall(); conn.close()
+    body = "<h2>意見箱確認</h2>"
+    if not rows:
+        body += '<div class="box">まだ意見はありません。</div>'
+    for r in rows:
+        status = r["status"] if "status" in r.keys() and r["status"] else "pending"
+        if status == "done":
+            status_html = '<span class="help-status-rejected">確認済み</span>'
+            action = ""
+        else:
+            status_html = '<span class="help-status-pending">未確認</span>'
+            action = f'<a class="btn confirm small-btn" href="/mark-opinion-read/{r["id"]}">確認済みにする</a>'
+        body += f"""
+        <div class='box'>
+            <b>{escape(r['name'])}</b>　{status_html}<br>
+            {escape(r['message'])}<br>
+            <small>{escape(r['created_at'])}</small><br>
+            {action}
+        </div>
+        """
+    body += "<a class='btn back' href='/admin'>戻る</a>"
+    return layout("意見箱確認", body, user=user)
+
+
+@app.post("/mark-opinion-read/{opinion_id}")
+async def mark_opinion_read(opinion_id: int, request: Request):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("UPDATE opinions SET status = 'done' WHERE id = ?", (opinion_id,))
+    await conn.commit()
+    conn.close()
+    return redirect("/admin-opinions")
+
+
+@app.get("/admin-labor", response_class=HTMLResponse)
+async def admin_labor(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    today = jst_today()
+    year = year or today.year
+    month = month or today.month
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    # その月の予算
+    ym = f"{year}-{month:02d}"
+    await cur.execute("SELECT budget FROM labor_budgets WHERE ym = ?", (ym,))
+    b = cur.fetchone()
+    budget = int(b["budget"] or 0) if b else 0
+
+    # 月別人件費 1〜12月
+    monthly_rows = []
+    for m in range(1, 13):
+        last_day = monthrange(year, m)[1]
+        start_date = f"{year}-{m:02d}-01"
+        end_date = f"{year}-{m:02d}-{last_day:02d}"
+
+        await cur.execute("""
+        SELECT s.*, u.hourly_wage
+        FROM shifts s
+        LEFT JOIN users u ON s.user_id = u.login_id
+        WHERE s.date BETWEEN ? AND ?
+          AND IFNULL(s.cut, 0) = 0
+          AND IFNULL(s.confirmed, 0) = 1
+        """, (start_date, end_date))
+        shift_rows = cur.fetchall()
+
+        total = 0
+        for r in shift_rows:
+            wage = int(r["hourly_wage"] or 0)
+            total += int(calc_hours(r["start"], r["end"]) * wage)
+
+        await cur.execute("SELECT budget FROM labor_budgets WHERE ym = ?", (f"{year}-{m:02d}",))
+        br = cur.fetchone()
+        mbudget = int(br["budget"] or 0) if br else 0
+        diff = mbudget - total
+        monthly_rows.append({"month": m, "total": total, "budget": mbudget, "diff": diff})
+
+    # 選択月の従業員別内訳
+    last_day = monthrange(year, month)[1]
+    start_date = f"{year}-{month:02d}-01"
+    end_date = f"{year}-{month:02d}-{last_day:02d}"
+
+    await cur.execute("""
+    SELECT s.*, u.hourly_wage
+    FROM shifts s
+    LEFT JOIN users u ON s.user_id = u.login_id
+    WHERE s.date BETWEEN ? AND ?
+      AND IFNULL(s.cut, 0) = 0
+      AND IFNULL(s.confirmed, 0) = 1
+    ORDER BY s.name ASC, s.date ASC
+    """, (start_date, end_date))
+    selected_shifts = cur.fetchall()
+    conn.close()
+
+    employee = {}
+    total_cost = 0
+    total_hours = 0
+    for r in selected_shifts:
+        name = r["name"] or "未設定"
+        wage = int(r["hourly_wage"] or 0)
+        h = calc_hours(r["start"], r["end"])
+        cost = int(h * wage)
+        total_cost += cost
+        total_hours += h
+        if name not in employee:
+            employee[name] = {"hours": 0, "cost": 0, "wage": wage}
+        employee[name]["hours"] += h
+        employee[name]["cost"] += cost
+        employee[name]["wage"] = wage
+
+    diff = budget - total_cost
+    diff_text = f"+{diff:,} 円" if diff >= 0 else f"-{abs(diff):,} 円"
+    diff_color = "#19a974" if diff >= 0 else "#e53935"
+
+    max_value = max([x["total"] for x in monthly_rows] + [x["budget"] for x in monthly_rows] + [1])
+    chart = ""
+    for x in monthly_rows:
+        total_w = int((x["total"] / max_value) * 100)
+        budget_w = int((x["budget"] / max_value) * 100) if x["budget"] else 0
+        d = x["diff"]
+        d_text = f"+{d:,}" if d >= 0 else f"-{abs(d):,}"
+        d_color = "#19a974" if d >= 0 else "#e53935"
+        chart += f"""
+        <div class="labor-chart-row">
+            <div class="labor-month">{x['month']}月</div>
+            <div class="labor-bars">
+                <div class="labor-bar total" style="width:{total_w}%">実績 {x['total']:,}</div>
+                <div class="labor-bar budget" style="width:{budget_w}%">予算 {x['budget']:,}</div>
+            </div>
+            <div class="labor-diff" style="color:{d_color};">{d_text}</div>
+        </div>
+        """
+
+    emp_rows = ""
+    if employee:
+        for name, v in employee.items():
+            emp_rows += f"""
+            <tr>
+                <td>{escape(name)}</td>
+                <td>{v['hours']:.1f} h</td>
+                <td>{int(v['wage']):,} 円</td>
+                <td>{int(v['cost']):,} 円</td>
+            </tr>
+            """
+    else:
+        emp_rows = '<tr><td colspan="4">この月の確定シフトはありません。</td></tr>'
+
+    extra_style = """
+    <style>
+        .labor-summary { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .labor-card { background:white; border-radius:18px; padding:18px; box-shadow:0 6px 18px rgba(0,0,0,.08); }
+        .labor-number { font-size:28px; font-weight:900; margin-top:8px; }
+        .labor-chart-row { display:grid; grid-template-columns:48px 1fr 82px; gap:10px; align-items:center; margin:12px 0; }
+        .labor-month { font-weight:800; }
+        .labor-bars { background:#f2f5f0; border-radius:12px; padding:6px; }
+        .labor-bar { height:24px; border-radius:999px; margin:4px 0; color:white; font-size:12px; font-weight:800; line-height:24px; padding-left:8px; box-sizing:border-box; white-space:nowrap; min-width:48px; }
+        .labor-bar.total { background:#8CC63F; }
+        .labor-bar.budget { background:#333; }
+        .labor-diff { font-weight:900; text-align:right; }
+        @media(max-width:600px){ .labor-summary{grid-template-columns:1fr;} .labor-chart-row{grid-template-columns:40px 1fr 70px;} }
+    </style>
+    """
+
+    body = f"""
+    {extra_style}
+    <h2>人件費計算</h2>
+
+    <form class="month-form" action="/admin-labor" method="get">
+        <div><label>年</label><input type="number" name="year" value="{year}"></div>
+        <div><label>月</label><input type="number" name="month" value="{month}"></div>
+        <button type="submit">表示</button>
+    </form>
+
+    <div class="box">
+        <form action="/admin-labor-budget" method="post">
+            <input type="hidden" name="year" value="{year}">
+            <input type="hidden" name="month" value="{month}">
+            <label>{year}年{month}月の予算</label>
+            <input type="number" name="budget" value="{budget}" min="0" placeholder="例：500000">
+            <button type="submit">予算を保存</button>
+        </form>
+    </div>
+
+    <div class="labor-summary">
+        <div class="labor-card"><div>総人件費</div><div class="labor-number">{total_cost:,} 円</div></div>
+        <div class="labor-card"><div>総勤務時間</div><div class="labor-number">{total_hours:.1f} h</div></div>
+        <div class="labor-card"><div>予算</div><div class="labor-number">{budget:,} 円</div></div>
+        <div class="labor-card"><div>予算差額</div><div class="labor-number" style="color:{diff_color};">{diff_text}</div></div>
+    </div>
+
+    <div class="box" style="margin-top:16px;">
+        <b>注意：</b>この人件費は、従業員の登録時給と確定シフト時間から計算した概算です。深夜手当、残業、休憩、交通費、控除、実際の勤怠打刻は反映していません。
+    </div>
+
+    <div class="box">
+        <h3>{year}年 月別グラフ</h3>
+        {chart}
+    </div>
+
+    <div class="box">
+        <h3>{year}年{month}月 従業員別内訳</h3>
+        <table>
+            <tr><th>名前</th><th>時間</th><th>時給</th><th>人件費</th></tr>
+            {emp_rows}
+        </table>
+    </div>
+
+    <a class="btn back" href="/admin">戻る</a>
+    """
+    return layout("人件費計算", body, user=user)
+
+
+@app.post("/admin-labor-budget")
+async def admin_labor_budget(request: Request, year: int = Form(...), month: int = Form(...), budget: int = Form(...)):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+    ym = f"{year}-{month:02d}"
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("""
+    INSERT INTO labor_budgets (ym, budget)
+    VALUES (?, ?)
+    ON CONFLICT(ym) DO UPDATE SET budget = excluded.budget
+    """, (ym, budget))
+    await conn.commit()
+    conn.close()
+    return redirect(f"/admin-labor?year={year}&month={month}")
+
+@app.get("/admin-export-excel", response_class=HTMLResponse)
+async def admin_export_excel(request: Request, year: int = None, month: int = None):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    today = jst_today()
+    year = year or today.year
+    month = month or today.month
+    last_day = monthrange(year, month)[1]
+
+    body = f"""
+    <h2>Excel書き出し</h2>
+    <div class="box">
+        <p>印刷しやすいように、1日〜15日・16日〜月末・月全体を分けてExcel出力できます。</p>
+        <form class="month-form" action="/admin-export-excel" method="get">
+            <div><label>年</label><input type="number" name="year" value="{year}"></div>
+            <div><label>月</label><input type="number" name="month" value="{month}"></div>
+            <button type="submit">表示月を変更</button>
+        </form>
+    </div>
+
+    <div class="box">
+        <h3>{year}年{month}月 Excel出力</h3>
+        <a class="btn confirm" href="/admin-export-excel-download?year={year}&month={month}&period=first">前半（1日〜15日）をダウンロード</a>
+        <a class="btn confirm" href="/admin-export-excel-download?year={year}&month={month}&period=second">後半（16日〜{last_day}日）をダウンロード</a>
+        <a class="btn" href="/admin-export-excel-download?year={year}&month={month}&period=all">月全体をダウンロード</a>
+    </div>
+
+    <div class="box">
+        <b>出力内容</b><br>
+        ・従業員一覧（ID順）<br>
+        ・期間内の確定シフト<br>
+        ・朝/夜などの人員不足メモ<br>
+        ・日付メモ<br>
+        ・集計シート（従業員別の合計時間）<br>
+        ・セルサイズはそのまま、文字は見やすく大きめ
+    </div>
+
+    <a class="btn back" href="/admin">戻る</a>
+    """
+    return layout("Excel書き出し", body, user=user)
+
+
+def excel_time_text(start, end):
+    if not start or not end:
+        return ""
+    return f"{start.replace(':00', '')}-{end.replace(':00', '')}"
+
+
+def shortage_text_for_excel(shifts):
+    segments = help_segments(shifts)
+    if not segments:
+        return ""
+
+    middle_parts = []
+    morning_deficit = 0
+    night_deficit = 0
+
+    for hs, he, deficit in segments:
+        if deficit <= 0:
+            continue
+
+        # 9:00-10:00 にかかる不足は「朝○人」にまとめる
+        if hs < START_HOUR + 1 and he > START_HOUR:
+            morning_deficit = max(morning_deficit, deficit)
+            # 朝枠を除いた後ろ側があるなら中間不足として残す
+            if he > START_HOUR + 1:
+                s = hour_to_str(START_HOUR + 1).replace(":00", "")
+                e = hour_to_str(he).replace(":00", "")
+                middle_parts.append(f"{s}-{e} {deficit}人")
+            continue
+
+        # 21:00-22:00 にかかる不足は「夜○人」に1つだけまとめる
+        if hs < END_HOUR and he > END_HOUR - 1:
+            night_deficit = max(night_deficit, deficit)
+            # 夜枠より前に不足が伸びていたら中間不足として残す
+            if hs < END_HOUR - 1:
+                s = hour_to_str(hs).replace(":00", "")
+                e = hour_to_str(END_HOUR - 1).replace(":00", "")
+                middle_parts.append(f"{s}-{e} {deficit}人")
+            continue
+
+        s = hour_to_str(hs).replace(":00", "")
+        e = hour_to_str(he).replace(":00", "")
+        middle_parts.append(f"{s}-{e} {deficit}人")
+
+    parts = []
+    if morning_deficit > 0:
+        parts.append(f"朝{morning_deficit}人")
+    parts.extend(middle_parts)
+    if night_deficit > 0:
+        parts.append(f"夜{night_deficit}人")
+
+    return " / ".join(parts)
+
+
+@app.get("/admin-export-excel-download")
+async def admin_export_excel_download(request: Request, year: int = None, month: int = None, period: str = "all"):
+    user = await require_login(request)
+    if not user or not is_admin_user(user):
+        return redirect("/portal")
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
+        from openpyxl.utils import get_column_letter
+    except Exception:
+        return HTMLResponse("""
+        <h2>openpyxl が必要です</h2>
+        <p>ターミナルで以下を実行してから、もう一度ダウンロードしてください。</p>
+        <pre>python3 -m pip install openpyxl</pre>
+        <a href="/admin-export-excel">戻る</a>
+        """)
+
+    today = jst_today()
+    year = year or today.year
+    month = month or today.month
+    last_day = monthrange(year, month)[1]
+
+    if period == "first":
+        start_day = 1
+        end_day = min(15, last_day)
+        period_label = "前半"
+    elif period == "second":
+        start_day = 16
+        end_day = last_day
+        period_label = "後半"
+    else:
+        start_day = 1
+        end_day = last_day
+        period_label = "月全体"
+
+    start_date = f"{year}-{month:02d}-{start_day:02d}"
+    end_date = f"{year}-{month:02d}-{end_day:02d}"
+    day_numbers = list(range(start_day, end_day + 1))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    await cur.execute("SELECT login_id, name, status FROM users ORDER BY CAST(login_id AS INTEGER) ASC, login_id ASC")
+    employees = cur.fetchall()
+
+    await cur.execute("""
+        SELECT * FROM shifts
+        WHERE date BETWEEN ? AND ? AND confirmed = 1 AND cut = 0
+        ORDER BY date ASC, start ASC
+    """, (start_date, end_date))
+    shifts = cur.fetchall()
+
+    await cur.execute("SELECT date, memo FROM day_memos WHERE date BETWEEN ? AND ?", (start_date, end_date))
+    memo_rows = cur.fetchall()
+    conn.close()
+
+    memo_map = {r["date"]: r["memo"] for r in memo_rows}
+    shifts_by_user_day = {}
+    shifts_by_day = {}
+    for r in shifts:
+        shifts_by_user_day.setdefault((r["user_id"], r["date"]), []).append(r)
+        shifts_by_day.setdefault(r["date"], []).append(r)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{year}年{month}月{period_label}"
+
+    # colors
+    green = "8CC63F"
+    light_green = "D9EAD3"
+    cream = "FFF2CC"
+    pink = "F4CCCC"
+    blue = "C9DAF8"
+    purple = "D9D2E9"
+    yellow = "FFD966"
+    white = "FFFFFF"
+
+    thin = Side(style="thin", color="000000")
+    border = Border(top=thin, left=thin, right=thin, bottom=thin)
+
+    # title row / shortage row
+    ws.cell(1, 1, "人数不足")
+    ws.cell(1, 2, "")
+    ws.cell(2, 1, "No")
+    ws.cell(2, 2, "従業員")
+
+    for idx, d in enumerate(day_numbers, start=1):
+        day = f"{year}-{month:02d}-{d:02d}"
+        dt = date(year, month, d)
+        youbi = ["月", "火", "水", "木", "金", "土", "日"][dt.weekday()]
+        col = idx + 2
+        ws.cell(1, col, shortage_text_for_excel(shifts_by_day.get(day, [])))
+        ws.cell(2, col, f"{d}日（{youbi}）")
+
+    max_col = len(day_numbers) + 2
+
+    # headers
+    for row in [1, 2]:
+        for col in range(1, max_col + 1):
+            cell = ws.cell(row, col)
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.font = Font(bold=True, size=13)
+            if row == 1:
+                cell.fill = PatternFill("solid", fgColor=purple if col <= 2 else yellow)
+            else:
+                cell.fill = PatternFill("solid", fgColor=light_green)
+
+    # employee rows
+    first_emp_row = 3
+    summary = {}
+    for i, emp in enumerate(employees, start=1):
+        row = first_emp_row + i - 1
+        emp_name = emp["name"] or emp["login_id"]
+        ws.cell(row, 1, i)
+        ws.cell(row, 2, f"{emp['login_id']} {emp_name}")
+        summary[emp["login_id"]] = {
+            "name": emp_name,
+            "status": emp["status"] if "status" in emp.keys() and emp["status"] else "",
+            "hours": 0.0,
+            "days": 0
+        }
+
+        for base_col in [1, 2]:
+            ws.cell(row, base_col).fill = PatternFill("solid", fgColor=cream)
+
+        for idx, d in enumerate(day_numbers, start=1):
+            col = idx + 2
+            day = f"{year}-{month:02d}-{d:02d}"
+            day_shifts = shifts_by_user_day.get((emp["login_id"], day), [])
+            value = "\n".join(excel_time_text(r["start"], r["end"]) for r in day_shifts if r["start"] and r["end"])
+            cell = ws.cell(row, col, value)
+
+            if day_shifts:
+                summary[emp["login_id"]]["days"] += 1
+                summary[emp["login_id"]]["hours"] += sum(calc_hours(r["start"], r["end"]) for r in day_shifts)
+
+            if value:
+                # 朝昼はピンク、夕方以降は青
+                first_start = parse_time_to_hour(day_shifts[0]["start"])
+                fill = pink if first_start is not None and first_start < 15 else blue
+                cell.fill = PatternFill("solid", fgColor=fill)
+            else:
+                cell.fill = PatternFill("solid", fgColor=white)
+
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for col in range(1, max_col + 1):
+            ws.cell(row, col).border = border
+            ws.cell(row, col).font = Font(size=12)
+
+    # memo row
+    memo_row = first_emp_row + len(employees)
+    ws.cell(memo_row, 1, "")
+    ws.cell(memo_row, 2, "メモ")
+    for col in range(1, max_col + 1):
+        ws.cell(memo_row, col).fill = PatternFill("solid", fgColor=yellow)
+        ws.cell(memo_row, col).border = border
+        ws.cell(memo_row, col).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.cell(memo_row, col).font = Font(bold=True if col <= 2 else False, size=12)
+
+    for idx, d in enumerate(day_numbers, start=1):
+        day = f"{year}-{month:02d}-{d:02d}"
+        ws.cell(memo_row, idx + 2, memo_map.get(day, ""))
+
+    # formatting - セルサイズは従来と同じ
+    ws.freeze_panes = "C3"
+    ws.column_dimensions["A"].width = 5
+    ws.column_dimensions["B"].width = 20
+    for col in range(3, max_col + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 13
+    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[2].height = 24
+    for row in range(3, memo_row + 1):
+        ws.row_dimensions[row].height = 24
+
+    ws.sheet_view.showGridLines = False
+
+    # 集計シート
+    summary_ws = wb.create_sheet("集計")
+    summary_ws.cell(1, 1, f"{year}年{month}月 {period_label} 集計")
+    summary_ws.cell(2, 1, "ID")
+    summary_ws.cell(2, 2, "名前")
+    summary_ws.cell(2, 3, "ステータス")
+    summary_ws.cell(2, 4, "出勤日数")
+    summary_ws.cell(2, 5, "合計時間")
+
+    for col in range(1, 6):
+        c = summary_ws.cell(2, col)
+        c.font = Font(bold=True, size=13)
+        c.fill = PatternFill("solid", fgColor=light_green)
+        c.border = border
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    row = 3
+    for emp in employees:
+        s = summary.get(emp["login_id"], {})
+        summary_ws.cell(row, 1, emp["login_id"])
+        summary_ws.cell(row, 2, s.get("name", ""))
+        summary_ws.cell(row, 3, s.get("status", ""))
+        summary_ws.cell(row, 4, s.get("days", 0))
+        summary_ws.cell(row, 5, round(s.get("hours", 0.0), 2))
+        for col in range(1, 6):
+            c = summary_ws.cell(row, col)
+            c.font = Font(size=12)
+            c.border = border
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        row += 1
+
+    summary_ws.column_dimensions["A"].width = 12
+    summary_ws.column_dimensions["B"].width = 20
+    summary_ws.column_dimensions["C"].width = 20
+    summary_ws.column_dimensions["D"].width = 12
+    summary_ws.column_dimensions["E"].width = 12
+    summary_ws.sheet_view.showGridLines = False
+
+    output = BytesIO()
+    for sheet in wb.worksheets:
+        for row in sheet:
+            for cell in row:
+                if cell.data_type == 'f':
+                    cell.data_type = 's'
+    wb.save(output)
+    output.seek(0)
+
+    period_name = "first" if period == "first" else "second" if period == "second" else "all"
+    filename = f"FE_shift_{year}_{month:02d}_{period_name}.xlsx"
+    headers = {"Content-Disposition": f"attachment; filename={filename}"}
+    return Response(
+        output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
+
+
+
+
+
+
+# ---- Cloudflare D1 storage and security boundary ----
+import base64
+import hashlib
+import hmac
+import secrets
+import time
+import re
+from contextvars import ContextVar
+from urllib.parse import urlsplit, unquote
+from html import unescape
+
+_context = ContextVar('fe_request')
+COOKIE = '__Host-fe_session'
+CSRF_COOKIE = '__Host-fe_csrf'
+SESSION_SECONDS = 12 * 3600
+BACKUP_KEEP = 10
+MUTATING_PREFIXES = ('/delete-my-shift/', '/delete-shift-admin/', '/confirm-shift/',
+    '/cut-shift/', '/set-publish/', '/cancel-help/', '/approve-help/',
+    '/reject-help/', '/mark-opinion-read/')
+
+
+def jst_now():
+    return datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
+
+
+def jst_today():
+    return jst_now().date()
+
+
+def native(value):
+    return value.to_py() if hasattr(value, 'to_py') else value
+
+
+class Row(dict):
+    def __getitem__(self, key):
+        return list(self.values())[key] if isinstance(key, int) else super().__getitem__(key)
+
+
+class DatabaseConflict(Exception):
+    pass
+
+
+async def query(sql, params=()):
+    state = _context.get()
+    key = (sql, tuple(params))
+    if key not in state['cache']:
+        result = native(await state['db'].prepare(sql).bind(*params).all())
+        if not result.get('success', True):
+            raise RuntimeError('D1 query failed')
+        state['cache'][key] = [Row(native(r)) for r in result.get('results', [])]
+    return state['cache'][key]
+
+
+async def run_batch(statements):
+    if not statements:
+        return []
+    state = _context.get()
+    try:
+        result = native(await state['db'].batch([
+            state['db'].prepare(sql).bind(*params) for sql, params in statements
+        ]))
+        if any(not native(r).get('success', True) for r in result):
+            raise RuntimeError('D1 batch failed')
+        return result
+    except Exception as e:
+        if 'UNIQUE constraint' in str(e):
+            raise DatabaseConflict() from None
+        raise
+    finally:
+        state['cache'].clear()
+
+
+class D1Connection:
+    """Queue writes until commit; one D1 batch is one atomic transaction.
+
+    SELECT/PRAGMA reads run immediately. Handlers must not depend on reading
+    queued writes; metadata checks after queued writes are safe.
+    """
+    def __init__(self):
+        self.pending = []
+        self.rows = []
+
+    def cursor(self):
+        return self
+
+    async def execute(self, sql, params=()):
+        verb = sql.strip().split()[0].upper()
+        if verb == 'BEGIN':
+            return self
+        if verb in ('SELECT', 'PRAGMA'):
+            self.rows = await query(sql, params)
+        else:
+            self.pending.append((sql, tuple(params)))
+            self.rows = []
+        return self
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+    async def commit(self):
+        if self.pending:
+            # Snapshot and mutation share the same D1 transaction.
+            prefix = await backup_statements(_context.get().get('backup_reason', 'before_change'))
+            await run_batch(prefix + self.pending)
+            self.pending.clear()
+
+    def close(self):
+        self.pending.clear()
+
+
+def db_connect():
+    return D1Connection()
+
+
+async def has_column(cur, table, col):
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table):
+        return False
+    rows = await query(f'PRAGMA table_info("{table}")')
+    return any(r['name'] == col for r in rows)
+
+
+async def backup_before_change(reason='change'):
+    _context.get()['backup_reason'] = reason
+
+
+async def backup_statements(reason):
+    # Full application tables including optional history tables, excluding
+    # credentials/session tokens. This is an application recovery snapshot;
+    # a disaster-recovery D1 export is additionally required before migration.
+    tables = await query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'fe_%' ORDER BY name")
+    pieces = []
+    for row in tables:
+        table = row['name']
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table):
+            raise RuntimeError('Unsupported table name for backup')
+        cols = await query(f'PRAGMA table_info("{table}")')
+        fields = []
+        for col in cols:
+            name = col['name']
+            if name.lower() in ('password', 'password_hash', 'secret', 'token'):
+                continue
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                raise RuntimeError('Unsupported backup column')
+            fields.extend(["'"+name+"'", '"'+name+'"'])
+        pieces.extend(["'"+table+"'", f'(SELECT json_group_array(json_object({",".join(fields)})) FROM "{table}")'])
+    sql = "INSERT INTO fe_backups(created_at,reason,payload) SELECT ?,?,json_object("+','.join(pieces)+')'
+    return [(sql,(jst_now().isoformat(),reason)),
+            ('DELETE FROM fe_backups WHERE id NOT IN (SELECT id FROM fe_backups ORDER BY id DESC LIMIT 10)',())]
+
+
+def secret_key():
+    value = str(getattr(_context.get()['env'], 'SESSION_SECRET', '') or '')
+    if len(value) < 32:
+        raise HTTPException(503, 'SESSION_SECRETには32文字以上のランダム値が必要です。')
+    return value.encode()
+
+
+def digest(value):
+    return hmac.new(secret_key(), value.encode(), hashlib.sha256).hexdigest()
+
+
+async def hash_password(password):
+    if not 10 <= len(password) <= 256:
+        raise HTTPException(422, '新しいパスワードは10〜256文字で入力してください。')
+    salt = secrets.token_hex(16)
+    hashed = await derive_password(password, salt, 600000)
+    return f'pbkdf2_sha256$600000${salt}${hashed}'
+
+
+async def verify_password(password, stored):
+    if not isinstance(stored, str) or len(password) > 256:
+        return False
+    if stored.startswith('pbkdf2_sha256$'):
+        try:
+            _, rounds, salt, expected = stored.split('$')
+            if not 100000 <= int(rounds) <= 1000000:
+                return False
+            actual = await derive_password(password, salt, int(rounds))
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    return hmac.compare_digest(password.encode(), stored.encode())
 
 
 async def current_user(request):
-    uid = parse_token(request.cookies.get(COOKIE))
-    if not uid or DB is None:
-        return None
-    result = await DB.prepare('SELECT id,login_id,name,is_admin,status FROM users WHERE id = ?').bind(uid).first()
-    return result
+    state = _context.get()
+    if 'user' in state:
+        return state['user']
+    token = request.cookies.get(COOKIE, '')
+    rows = []
+    if re.fullmatch(r'[A-Za-z0-9_-]{43}', token):
+        rows = await query('SELECT u.*,s.password_tag FROM fe_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?', (digest(token),int(time.time())))
+    user = rows[0] if rows else None
+    if user and not hmac.compare_digest(user['password_tag'], digest(user['password'] or '')):
+        user = None
+    state['user'] = user
+    return user
 
 
-def field(row, key):
+def get_user_status(login_id):
+    return _context.get()['statuses'].get(login_id, 'アルバイト')
+
+
+def csrf_token():
+    return _context.get()['csrf']
+
+
+def csrf_valid(token):
     try:
-        return row[key]
-    except (KeyError, TypeError):
-        return getattr(row, key, None)
+        expiry, nonce, signature = token.split('.')
+        return int(expiry) > int(time.time()) and hmac.compare_digest(signature, digest(expiry+'.'+nonce))
+    except (ValueError, TypeError):
+        return False
 
 
-@app.get('/', response_class=HTMLResponse)
-async def index(request: Request):
-    if await current_user(request):
-        return RedirectResponse('/portal', status_code=303)
-    return page('ログイン', '<div class="card"><h2>ログイン</h2><form action="/login" method="post"><label>ログインID<input name="login_id" required autocomplete="username"></label><label>パスワード<input name="password" type="password" required autocomplete="current-password"></label><button>ログイン</button></form></div>')
+def csrf_new():
+    body = str(int(time.time())+SESSION_SECONDS)+'.'+secrets.token_urlsafe(24)
+    return body+'.'+digest(body)
+
+
+def secured_html(html):
+    token = escape(csrf_token(), quote=True)
+    html = re.sub(r'(<form\b[^>]*>)', lambda m: m[0]+(f'<input type="hidden" name="csrf_token" value="{token}">' if re.search(r'''method\s*=\s*["']?post\b''',m[0],re.I) else ''), html, flags=re.I)
+    # Existing action links become ordinary POST forms, usable without JavaScript.
+    def link(m):
+        attrs, label = m.group(1), m.group(2)
+        h = re.search(r'''href\s*=\s*(["'])(.*?)\1''', attrs, re.I)
+        if not h:
+            return m[0]
+        url = unescape(h.group(2))
+        if not (url.startswith(MUTATING_PREFIXES) or url == '/logout'):
+            return m[0]
+        if 'setPublishAjax' in attrs:
+            return m[0]  # POST + CSRF is sent by the existing AJAX function.
+        cls = re.search(r'''class\s*=\s*(["'])(.*?)\1''',attrs,re.I)
+        classes = escape(cls.group(2),quote=True) if cls else 'btn'
+        style = re.search(r'''style\s*=\s*(["'])(.*?)\1''', attrs, re.I)
+        style_attr = ' style="'+escape(style.group(2),quote=True)+'"' if style else ''
+        confirmation = ' onclick="return confirm(\'この操作を実行しますか？\');"' if 'return confirm(' in attrs else ''
+        return f'<form action="{escape(url,quote=True)}" method="post" style="display:inline"><input type="hidden" name="csrf_token" value="{token}"><button class="{classes}" type="submit"{style_attr}{confirmation}>{label}</button></form>'
+    html = re.sub(r'<a\b([^>]*)>(.*?)</a>',link,html,flags=re.I|re.S)
+    meta=f'<meta name="csrf-token" content="{token}">'
+    return html.replace('<head>','<head>'+meta,1) if '<head>' in html else meta+html
+
+
+def validate_inputs(request, form):
+    values = list(request.query_params.multi_items()) + list(form.multi_items() if hasattr(form, "multi_items") else form.items())
+    for key,value in values:
+        if not isinstance(value,str) or len(value)>10000:
+            raise HTTPException(422,'入力が長すぎます。')
+        if key in ('year','return_year') and value and not 2000 <= int(value) <= 2100:
+            raise HTTPException(422,'年が範囲外です。')
+        if key in ('month','return_month') and value and not 1 <= int(value) <= 12:
+            raise HTTPException(422,'月が範囲外です。')
+        if key in ('hourly_wage','budget') and value and not 0 <= int(value) <= 100000000:
+            raise HTTPException(422,'金額が範囲外です。')
+        if key in ('date','day','date_value','selected_dates','return_date','shift_date') and value:
+            date.fromisoformat(value)
+        if key in ('login_id',) and value and not re.fullmatch(r'[A-Za-z0-9_.@-]{1,64}',value):
+            raise HTTPException(422,'IDは半角英数字と _ . @ - の64文字以内にしてください。')
+    for key,value in values:
+        if key=='start' or key.startswith('start_'):
+            end = form.get(key.replace('start','end',1), request.query_params.get('end',''))
+            if value or end:
+                if not re.fullmatch(r'(09|1[0-9]|2[01]):(00|30)|22:00',value or '') or not re.fullmatch(r'(09|1[0-9]|2[01]):(00|30)|22:00',end or '') or value>=end:
+                    raise HTTPException(422,'勤務時間は9:00〜22:00の30分単位で、開始より後に終了を設定してください。')
+
+
+@app.middleware('http')
+async def security_boundary(request, call_next):
+    env = request.scope.get('env')
+    if env is None or not hasattr(env,'DB'):
+        return HTMLResponse('D1接続が未設定です。', status_code=503)
+    state={'db':env.DB, 'env':env, 'cache':{}, 'statuses':{}}
+    reset=_context.set(state)
+    try:
+        secret_key()
+        token=request.cookies.get(CSRF_COOKIE,'')
+        state['csrf']=token if csrf_valid(token) else csrf_new()
+        if request.method not in ('GET','HEAD','POST'):
+            return Response(status_code=405)
+        form={}
+        if request.method=='POST':
+            if len(await request.body())>256000:
+                return Response(status_code=413)
+            origin=request.headers.get('origin')
+            expected=str(request.base_url).rstrip('/')
+            if origin and origin != expected:
+                return Response(status_code=403)
+            form=await request.form()
+            sent=request.headers.get('x-csrf-token') or form.get('csrf_token','')
+            if not token or not csrf_valid(token) or not hmac.compare_digest(str(sent),token):
+                return HTMLResponse('画面を再読み込みして、もう一度操作してください。',status_code=403)
+            # Starlette call_next replays the cached body; form is parsed separately downstream.
+        user=await current_user(request)
+        path=request.url.path
+        public=path in ('/','/login')
+        admin_path=(path.startswith('/admin') or path.startswith(('/delete-shift-admin/','/confirm-shift/','/cut-shift/','/set-publish/','/set-day-memo','/approve-help/','/reject-help/','/update-user-','/delete-user','/grant-admin/','/revoke-admin/','/mark-opinion-read/')) or path=='/register')
+        if not public and not user:
+            return redirect('/')
+        if admin_path and not is_admin_user(user):
+            return HTMLResponse('管理者権限が必要です。',status_code=403)
+        try:
+            validate_inputs(request,form)
+            if path.startswith('/set-publish/'):
+                _,_,day,val=path.split('/')
+                date.fromisoformat(day)
+                if val not in ('0','1'):raise ValueError()
+            if path.startswith('/delete-my-shift/'):
+                date.fromisoformat(path.rsplit('/',1)[1])
+        except (ValueError,TypeError):
+            return HTMLResponse('日付・時間・数値の入力を確認してください。',status_code=422)
+        if user:
+            state['statuses']={r['login_id']:r['status'] for r in await query('SELECT login_id,status FROM users')}
+        response=await call_next(request)
+        if response.headers.get('content-type','').startswith('text/html'):
+            body=b''.join([chunk async for chunk in response.body_iterator]).decode('utf-8')
+            headers=dict(response.headers)
+            headers.pop('content-length',None)
+            # Preserve duplicate Set-Cookie headers when replacing an HTML body.
+            cookies=[v for k,v in response.raw_headers if k.lower()==b'set-cookie']
+            headers.pop('set-cookie',None)
+            response=HTMLResponse(secured_html(body),status_code=response.status_code,headers=headers)
+            for cookie in cookies:response.raw_headers.append((b'set-cookie',cookie))
+        response.set_cookie(CSRF_COOKIE,state['csrf'],secure=True,httponly=True,samesite='strict',path='/',max_age=SESSION_SECONDS)
+        response.headers['Cache-Control']='no-store'
+        response.headers['X-Content-Type-Options']='nosniff'
+        response.headers['X-Frame-Options']='DENY'
+        response.headers['Referrer-Policy']='same-origin'
+        response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        return response
+    except HTTPException as e:
+        return HTMLResponse(escape(str(e.detail)),status_code=e.status_code)
+    finally:
+        _context.reset(reset)
 
 
 @app.post('/login')
-async def login(login_id: str = Form(...), password: str = Form(...)):
-    if DB is None or not SESSION_SECRET:
-        return page('設定エラー', '<p>データベースまたはSESSION_SECRETが未設定です。</p>')
-    result = await DB.prepare('SELECT id,password FROM users WHERE login_id = ?').bind(login_id).first()
-    expected = field(result, 'password') if result else None
-    if expected is None or not hmac.compare_digest(str(expected), password):
-        return page('ログイン失敗', '<p>ログインIDまたはパスワードが違います。</p><a href="/">戻る</a>')
-    response = RedirectResponse('/portal', status_code=303)
-    response.set_cookie(COOKIE, make_token(field(result, 'id')), max_age=12*3600, httponly=True, secure=True, samesite='lax', path='/')
-    return response
+async def login(request: Request, login_id: str=Form(''), password: str=Form('')):
+    login_id=login_id.strip()
+    now=int(time.time())
+    # D1-backed counters work across isolates; account and trusted CF IP limits.
+    ip=request.headers.get('cf-connecting-ip','unknown')
+    keys=[digest('login:'+login_id),digest('ip:'+ip)]
+    await run_batch([('INSERT INTO fe_login_limits(key,window_start,attempts) VALUES (?,?,1) ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN window_start<? THEN 1 ELSE attempts+1 END, window_start=CASE WHEN window_start<? THEN excluded.window_start ELSE window_start END',(k,now,now-900,now-900)) for k in keys])
+    for key,limit in zip(keys,(10,100)):
+        r=await query('SELECT attempts FROM fe_login_limits WHERE key=?',(key,))
+        if r[0]['attempts']>limit:
+            return HTMLResponse('しばらく待ってからログインしてください。',status_code=429)
+    rows=await query('SELECT * FROM users WHERE login_id=?',(login_id,))
+    user=rows[0] if rows else None
+    if not user or not await verify_password(password,user['password']):
+        return HTMLResponse(login_page('IDまたはパスワードが違います。'),status_code=401)
+    stored=user['password']
+    mutations=[]
+    if not stored.startswith('pbkdf2_sha256$'):
+        # Permit migration of existing short passwords without changing them.
+        salt=secrets.token_hex(16)
+        hashed=await derive_password(password, salt, 600000)
+        upgraded=f'pbkdf2_sha256$600000${salt}${hashed}'
+        mutations.append(('UPDATE users SET password=? WHERE id=? AND password=?',(upgraded,user['id'],stored)))
+        stored=upgraded
+    token=secrets.token_urlsafe(32)
+    # Insert only if the credential checked above still matches, preventing
+    # a concurrent password reset from creating a fresh valid session.
+    mutations.append(('INSERT INTO fe_sessions(token_hash,user_id,password_tag,expires_at) SELECT ?,id,?,? FROM users WHERE id=? AND password=?',(digest(token),digest(stored),now+SESSION_SECONDS,user['id'],stored)))
+    mutations.extend([('DELETE FROM fe_sessions WHERE expires_at<=?',(now,)),('DELETE FROM fe_login_limits WHERE window_start<?',(now-900,))])
+    await run_batch(mutations)
+    res=redirect('/portal')
+    res.set_cookie(COOKIE,token,max_age=SESSION_SECONDS,secure=True,httponly=True,samesite='lax',path='/')
+    res.delete_cookie('login_id',path='/')
+    res.delete_cookie('fe_session',path='/')
+    return res
 
 
-@app.get('/portal', response_class=HTMLResponse)
-async def portal(request: Request):
-    user = await current_user(request)
-    if not user:
-        return RedirectResponse('/', status_code=303)
-    name = escape(str(field(user, 'name') or 'ユーザー'))
-    return page('マイページ', '<div class="card"><h2>'+name+'さん、ようこそ</h2><p>D1から従業員情報を取得できました。</p><p>シフト提出・管理機能は移植途中です。</p><a href="/logout">ログアウト</a></div>')
+@app.get('/logout',response_class=HTMLResponse)
+async def logout_page():
+    return '<form action="/logout" method="post"><button>ログアウト</button></form>'
 
 
-@app.get('/logout')
-async def logout():
-    response = RedirectResponse('/', status_code=303)
-    response.delete_cookie(COOKIE, path='/')
-    return response
+@app.post('/logout')
+async def logout(request: Request):
+    token=request.cookies.get(COOKIE,'')
+    if token:await run_batch([('DELETE FROM fe_sessions WHERE token_hash=?',(digest(token),))])
+    res=redirect('/')
+    res.delete_cookie(COOKIE,path='/')
+    return res
+
+
+@app.post('/register')
+async def register(name: str=Form(''),login_id: str=Form(''),password: str=Form('')):
+    # This legacy route is now admin-only, enforced centrally.
+    if not name.strip() or not login_id.strip():raise HTTPException(422,'名前・IDを入力してください。')
+    conn=db_connect()
+    await conn.execute('INSERT INTO users(login_id,password,name,is_admin,hourly_wage,status) VALUES(?,?,?,0,0,?)',(login_id.strip(),await hash_password(password),name.strip(),'アルバイト'))
+    try:await conn.commit()
+    except DatabaseConflict:raise HTTPException(409,'そのIDはすでに使われています。')
+    return redirect('/admin-users')
+
+
+@app.post('/approve-help/{app_id}')
+async def approve_help(app_id: int, request: Request,year: int=None,month: int=None):
+    conn=db_connect()
+    await conn.execute("INSERT INTO shifts(user_id,name,date,start,end,limit_hour,memo,confirmed,cut,cut_memo) SELECT user_id,name,date,start,end,'ヘルプ承認','ヘルプ応募から追加',1,0,'' FROM help_applications WHERE id=? AND status='pending'",(app_id,))
+    await conn.execute("UPDATE help_applications SET status='approved' WHERE id=? AND status='pending'",(app_id,))
+    await conn.commit()
+    return redirect(f'/admin-help?year={year or jst_today().year}&month={month or jst_today().month}')
+
+
+@app.get('/admin-backups',response_class=HTMLResponse)
+async def admin_backups(request: Request):
+    rows=await query('SELECT id,created_at,reason,length(payload) AS size FROM fe_backups ORDER BY id DESC LIMIT 10')
+    body='<h2>バックアップ</h2><p>更新直前の業務データを最新10件保存します。認証情報は含みません。完全復旧用のD1エクスポートは別途安全な場所に保存してください。</p><form action="/admin-backup-create" method="post"><button>今すぐ作成</button></form>'
+    for row in rows:
+        body+=f'<div class="box">{escape(row["created_at"])} {escape(row["reason"])} ({row["size"]} bytes) <a href="/admin-backup-download/{row["id"]}">ダウンロード</a></div>'
+    return layout('バックアップ',body,user=await current_user(request))
+
+
+@app.post('/admin-backup-create')
+async def admin_backup_create():
+    await run_batch(await backup_statements('manual'))
+    return redirect('/admin-backups')
+
+
+@app.get('/admin-backup-download/{backup_id}')
+async def admin_backup_download(backup_id: int):
+    rows=await query('SELECT payload FROM fe_backups WHERE id=?',(backup_id,))
+    if not rows:raise HTTPException(404,'バックアップがありません。')
+    return Response(rows[0]['payload'],media_type='application/json',headers={'Content-Disposition':f'attachment; filename="fe-backup-{backup_id}.json"'})
 
 
 @app.get('/db-test')
-async def db_test():
-    if DB is None:
-        return JSONResponse({'status':'error','message':'D1 database is not connected'}, status_code=503)
-    result = await DB.prepare('SELECT COUNT(*) AS n FROM users').first()
-    return {'status':'ok','database':'connected','user_count':field(result,'n')}
+async def db_test(request: Request):
+    if not is_admin_user(await current_user(request)):raise HTTPException(403)
+    rows=await query('SELECT COUNT(*) AS n FROM users')
+    return {'status':'ok','user_count':rows[0]['n']}
 
 
-class Default(WorkerEntrypoint):
-    async def fetch(self, request):
-        global DB, SESSION_SECRET
-        DB = self.env.DB
-        SESSION_SECRET = getattr(self.env, 'SESSION_SECRET', None)
-        return await asgi.fetch(app, request, self.env)
+# Importing on CPython for tests never opens a local database or performs writes.
+try:
+    from workers import asgi
+except ImportError:
+    asgi=None
+if asgi is not None:
+    Default=asgi.entrypoint(app)
+
+
+async def derive_password(password, salt, rounds):
+    try:
+        from js import crypto, Uint8Array, Object
+        from pyodide.ffi import to_js
+    except ImportError:
+        return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), rounds).hex()
+    key = await crypto.subtle.importKey('raw', to_js(password.encode()), 'PBKDF2', False, to_js(['deriveBits']))
+    bits = await crypto.subtle.deriveBits(to_js({'name':'PBKDF2','salt':bytes.fromhex(salt),'iterations':rounds,'hash':'SHA-256'}, dict_converter=Object.fromEntries), key, 256)
+    return bytes(Uint8Array.new(bits).to_py()).hex()
