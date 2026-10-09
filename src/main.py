@@ -3422,7 +3422,7 @@ import secrets
 import time
 import re
 from contextvars import ContextVar
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit, unquote, parse_qs
 from html import unescape
 
 _context = ContextVar('fe_request')
@@ -3708,7 +3708,13 @@ async def security_boundary(request, call_next):
             expected=str(request.base_url).rstrip('/')
             if origin and origin != expected:
                 return Response(status_code=403)
-            form=await request.form()
+            # Parse the already-cached body without consuming Starlette's form stream.
+            # FastAPI must still be able to parse Form(...) in the endpoint.
+            raw_body = await request.body()
+            if request.headers.get('content-type', '').split(';')[0].strip() == 'application/x-www-form-urlencoded':
+                form = {k: v[-1] for k, v in parse_qs(raw_body.decode('utf-8'), keep_blank_values=True).items()}
+            else:
+                form = await request.form()
             sent=request.headers.get('x-csrf-token') or form.get('csrf_token','')
             if not token or not csrf_valid(token) or not hmac.compare_digest(str(sent),token):
                 return HTMLResponse('画面を再読み込みして、もう一度操作してください。',status_code=403)
@@ -3752,6 +3758,10 @@ async def security_boundary(request, call_next):
         return response
     except HTTPException as e:
         return HTMLResponse(escape(str(e.detail)),status_code=e.status_code)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return HTMLResponse('サーバー処理でエラーが発生しました。管理者にお問い合わせください。',status_code=500)
     finally:
         _context.reset(reset)
 
