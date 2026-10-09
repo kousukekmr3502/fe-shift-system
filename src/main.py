@@ -3475,6 +3475,8 @@ async def run_batch(statements):
         result = native(await state['db'].batch([
             state['db'].prepare(sql).bind(*params) for sql, params in statements
         ]))
+        if not isinstance(result, (list, tuple)):
+            result = list(result)
         if any(not native(r).get('success', True) for r in result):
             raise RuntimeError('D1 batch failed')
         return result
@@ -3870,6 +3872,15 @@ async def derive_password(password, salt, rounds):
         from pyodide.ffi import to_js
     except ImportError:
         return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), rounds).hex()
-    key = await crypto.subtle.importKey('raw', to_js(password.encode()), 'PBKDF2', False, to_js(['deriveBits']))
-    bits = await crypto.subtle.deriveBits(to_js({'name':'PBKDF2','salt':bytes.fromhex(salt),'iterations':rounds,'hash':'SHA-256'}, dict_converter=Object.fromEntries), key, 256)
+    password_bytes = Uint8Array.new(len(password.encode('utf-8')))
+    for i, b in enumerate(password.encode('utf-8')):
+        password_bytes[i] = b
+    salt_bytes = bytes.fromhex(salt)
+    salt_array = Uint8Array.new(len(salt_bytes))
+    for i, b in enumerate(salt_bytes):
+        salt_array[i] = b
+    key = await crypto.subtle.importKey('raw', password_bytes, 'PBKDF2', False, to_js(['deriveBits']))
+    options = to_js({'name': 'PBKDF2', 'salt': salt_array, 'iterations': int(rounds), 'hash': 'SHA-256'},
+                    dict_converter=Object.fromEntries)
+    bits = await crypto.subtle.deriveBits(options, key, 256)
     return bytes(Uint8Array.new(bits).to_py()).hex()
